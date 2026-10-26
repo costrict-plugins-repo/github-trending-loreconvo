@@ -1,0 +1,5741 @@
+"""SQLite database operations with FTS5 search."""
+
+import calendar
+import hashlib
+import json
+import logging
+import os
+import re
+import shutil
+import socket
+import sqlite3
+import threading
+import uuid
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import List, Optional
+
+from .config import Config
+from .hybrid_search import SEARCH_HALF_LIFE_DAYS, AUTOLOAD_HALF_LIFE_DAYS
+from .license import LORECONVO_UPGRADE_URL, get_license_status
+from .models import (
+    PersonaTag, Project, SearchResult, Session, SessionLink, SkillUsage
+)
+from . import trust_framing
+from .storage_core import (
+    SCHEMA_REVISION,
+    SCHEMA_SQL,
+    DREAMING_SCHEMA_SQL,
+    FTS_SQL,
+    FTS_TRIGGERS,
+    ANTI_PATTERN_SCHEMA_SQL,
+    _is_in_memory_db,
+    _open_conn,
+    _truncate_if_needed,
+    _MAX_DIRECT_SUMMARY_LENGTH,
+    _MAX_DIRECT_LIST_ITEM_LENGTH,
+    ensure_schema,
+    upsert_session,
+    remediate_permissions,
+    expand_compound_token,
+    sanitize_fts_query,
+    normalize_project_name,
+    PROJECT_ALIASES,
+)
+
+from .loredocs_bridge import (
+    CROSS_LINK_CAP,
+    CROSS_LINK_EMBEDDING_DIM,
+    CROSS_LINK_EMBEDDING_MODEL,
+    CROSS_LINK_DEBOUNCE_SECS,
+    CROSS_LINK_L2_THRESHOLD,
+    LoreDocsAccessError,
+    LoreDocsSchemaError,
+    discover_loredocs_db,
+    get_cross_product_links,
+    get_lancedb_path,
+    write_cross_product_link,
+)
+from .loredocs_bridge import _connect_readwrite, _verify_schema
+
+logger = logging.getLogger(__name__)
+
+
+def normalize_expiry_timestamp(value: str) -> str:
+    """Normalize an absolute ISO 8601 timestamp to UTC with a Z suffix."""
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("expires_at must include a timezone offset")
+    return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+# DDL constants for keep_forever schema components.
+# Used for both creation (slow path) and body validation (fast path).
+_CREATE_TRIGGER_SQL = (
+    "CREATE TRIGGER prevent_delete_pinned_sessions "
+    "BEFORE DELETE ON sessions "
+    "WHEN old.keep_forever = 1 "
+    "BEGIN "
+    "SELECT RAISE(ABORT, "
+    "'LORECONVO_PINNED_SESSION: Cannot delete a pinned session. "
+    "Unpin with set_keep_forever(id, False) before deleting.'); "
+    "END"
+)
+_CREATE_SESSIONS_PRUNABLE_VIEW_SQL = (
+    "CREATE VIEW sessions_prunable AS "
+    "SELECT * FROM sessions WHERE keep_forever = 0"
+)
+_CREATE_SESSIONS_PRUNABLE_DELETE_SQL = (
+    "CREATE TRIGGER sessions_prunable_delete "
+    "INSTEAD OF DELETE ON sessions_prunable "
+    "BEGIN "
+    "DELETE FROM sessions WHERE id = OLD.id AND keep_forever = 0; "
+    "END"
+)
+
+
+def _create_keep_forever_index(conn: sqlite3.Connection) -> None:
+    """Create partial index on keep_forever if SQLite >= 3.9.0, full index otherwise."""
+    version = tuple(
+        int(x) for x in
+        conn.execute("SELECT sqlite_version()").fetchone()[0].split(".")
+    )
+    if version >= (3, 9, 0):
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sessions_keep_forever "
+            "ON sessions(keep_forever) WHERE keep_forever = 1"
+        )
+    else:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sessions_keep_forever "
+            "ON sessions(keep_forever)"
+        )
+
+
+def _pinning_enabled(db) -> bool:
+    """Return False if session pinning is disabled via env var or config file.
+
+    Tier 1: LORECONVO_DISABLE_PINNING env var (any non-empty value disables).
+    Tier 2: ~/.loreconvo/config.json with {"pinning_enabled": false}.
+    """
+    if os.environ.get("LORECONVO_DISABLE_PINNING"):
+        return False
+    config_path = Path(db.config.db_path).parent / "config.json"
+    if config_path.exists():
+        try:
+            import json as _json
+            cfg = _json.loads(config_path.read_text(encoding="utf-8"))
+            if cfg.get("pinning_enabled") is False:
+                return False
+        except Exception:
+            pass  # malformed config -> pinning remains enabled (safe default)
+    return True
+
+
+def parse_session_id(raw: str) -> tuple:
+    """Return (session_id, None) on success or (None, error_dict) on failure.
+
+    Validates UUID format and canonicalizes to lowercase.
+    SQL injection is prevented by parameterized queries in all callers.
+    """
+    import uuid as _uuid
+    if not isinstance(raw, str) or not raw.strip():
+        return None, {
+            "ok": False,
+            "code": "invalid_session_id",
+            "message": "session_id must be a non-empty string.",
+        }
+    raw = raw.strip().lower()
+    try:
+        _uuid.UUID(raw)
+    except ValueError:
+        return None, {
+            "ok": False,
+            "code": "invalid_session_id",
+            "message": "session_id must be a valid UUID (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx).",
+        }
+    return raw, None
+
+
+def _validate_memory_session_id(conn: sqlite3.Connection, session_id: Optional[str]) -> Optional[dict]:
+    """Return an error dict if session_id is provided but not found; None on success.
+
+    Belt-and-suspenders on top of the FK enforcement already active via
+    PRAGMA foreign_keys=ON (set for every connection in _open_conn) -- this
+    gives callers a structured application-layer error instead of a raw
+    sqlite3.IntegrityError. [SH-12768 r4 HIGH #5]
+    """
+    if session_id is None:
+        return None
+    exists = conn.execute(
+        "SELECT 1 FROM sessions WHERE id=?", (session_id,)
+    ).fetchone()
+    if not exists:
+        return {
+            "ok": False,
+            "code": "session_not_found",
+            "message": "The provided session_id does not exist.",
+        }
+    return None
+
+
+_MEMORY_ITEM_FIELD_CAP = 4096
+
+
+def _truncate_text(value):
+    """Cap plain text at _MEMORY_ITEM_FIELD_CAP chars. Returns (value, truncated)."""
+    if value is None or len(value) <= _MEMORY_ITEM_FIELD_CAP:
+        return value, False
+    return value[:_MEMORY_ITEM_FIELD_CAP], True
+
+
+def truncate_session_fields(session: Session) -> bool:
+    """Cap session.summary/reasoning_notes and each decisions/open_questions
+    item at the ratified DIRECT-path lengths (SH-101938), mutating session
+    in place.
+
+    The direct-write path (save_session) deliberately allows MORE than the
+    SessionEnd hook path: the hook caps (500/8000, SH-13531) defend against
+    unbounded machine-generated transcript text with no human in the loop,
+    while the direct path holds deliberate, bounded, authored content.
+    The hook path keeps its own constants in auto_save.py -- this divergence
+    is the ratified outcome of SH-101938, not drift. Do NOT re-unify.
+    SH-101877 makes both paths share one truncation derivation
+    (_truncate_if_needed in storage_core), so a cut always carries the
+    [TRUNCATED: <field> exceeds <cap> chars] marker and the result never
+    exceeds the cap INCLUDING the marker.
+    Returns True if any field was cut.
+    """
+    truncated = False
+    if session.summary and len(session.summary) > _MAX_DIRECT_SUMMARY_LENGTH:
+        session.summary = _truncate_if_needed(
+            session.summary, _MAX_DIRECT_SUMMARY_LENGTH, "summary"
+        )
+        truncated = True
+    if session.reasoning_notes and len(session.reasoning_notes) > _MAX_DIRECT_SUMMARY_LENGTH:
+        session.reasoning_notes = _truncate_if_needed(
+            session.reasoning_notes, _MAX_DIRECT_SUMMARY_LENGTH, "reasoning_notes"
+        )
+        truncated = True
+
+    def _cap_list(items, field_name):
+        nonlocal truncated
+        capped = []
+        for item in items:
+            if item and len(item) > _MAX_DIRECT_LIST_ITEM_LENGTH:
+                capped.append(
+                    _truncate_if_needed(item, _MAX_DIRECT_LIST_ITEM_LENGTH, field_name)
+                )
+                truncated = True
+            else:
+                capped.append(item)
+        return capped
+
+    session.decisions = _cap_list(session.decisions, "decision")
+    session.open_questions = _cap_list(session.open_questions, "open_question")
+    return truncated
+
+
+def _truncate_json_list(items: list) -> tuple:
+    """Serialize a list to JSON, dropping trailing elements until it fits the cap.
+
+    Dropping (rather than char-slicing the encoded string) keeps the result
+    valid JSON, since memory_items.tags has CHECK(json_valid(tags) ...).
+    """
+    items = list(items)
+    encoded = json.dumps(items)
+    truncated = False
+    while len(encoded) > _MEMORY_ITEM_FIELD_CAP and items:
+        items.pop()
+        truncated = True
+        encoded = json.dumps(items)
+    return encoded, truncated
+
+
+def _truncate_json_dict(obj: dict) -> tuple:
+    """Serialize a dict to JSON, dropping trailing keys until it fits the cap.
+
+    Dropping (rather than char-slicing) keeps the result valid JSON, since
+    memory_items.metadata has CHECK(json_valid(metadata)).
+    """
+    obj = dict(obj)
+    encoded = json.dumps(obj)
+    truncated = False
+    while len(encoded) > _MEMORY_ITEM_FIELD_CAP and obj:
+        obj.popitem()
+        truncated = True
+        encoded = json.dumps(obj)
+    return encoded, truncated
+
+
+_MEMORY_ITEM_TYPES = ('decision', 'open_question', 'artifact')
+_MEMORY_ITEM_INITIAL_STATUS = {
+    'decision': 'active',
+    'open_question': 'open',
+    'artifact': 'active',
+}
+# (item_type, transition) -> resulting status. Artifacts have no transition
+# in v1 -- matches the architecture proposal's routing table, which only
+# defines 'retire' (decision) and 'answer'/'wont-answer' (open_question).
+_MEMORY_ITEM_TRANSITIONS = {
+    ('decision', 'retire'): 'retired',
+    ('open_question', 'answer'): 'answered',
+    ('open_question', 'wont-answer'): 'wont-answer',
+}
+_MEMORY_ITEM_TERMINAL_STATUSES = {
+    'decision': {'retired'},
+    'open_question': {'answered', 'wont-answer'},
+    'artifact': {'archived'},
+}
+
+
+def _check_shared_environment_warning() -> None:
+    """Warn if running over SSH on a shared account (unsupported trust model)."""
+    if os.environ.get("LORECONVO_SKIP_SSH_WARN"):
+        return
+    ssh_indicators = ("SSH_CLIENT", "SSH_TTY", "SSH_CONNECTION")
+    if any(os.environ.get(k) for k in ssh_indicators):
+        logger.warning(
+            "LoreConvo is running over an SSH connection. If this host has "
+            "multiple OS users sharing an account, the trust model (OS user = "
+            "sole authorized user) does not hold. Shared-account SSH environments "
+            "are not a supported configuration. Set LORECONVO_SKIP_SSH_WARN=1 "
+            "to suppress this warning."
+        )
+
+
+def _check_network_filesystem_warning(db_path: str) -> None:
+    """Warn if sessions.db appears to be on a network filesystem."""
+    if os.environ.get("LORECONVO_SKIP_NETWORK_FS_WARN"):
+        return
+    path = str(db_path)
+    network_prefixes = ("/Volumes/", "/net/", "/mnt/smb", "/mnt/nfs",
+                        "/media/nfs", "//")
+    if any(path.startswith(p) for p in network_prefixes):
+        logger.warning(
+            "sessions.db path '%s' appears to be on a network filesystem. "
+            "chmod 600 does not prevent access by root-level backup agents "
+            "or NFS/SMB servers. Move sessions.db to local storage if this "
+            "is a concern. Set LORECONVO_SKIP_NETWORK_FS_WARN=1 to suppress.",
+            path
+        )
+
+
+_IMPORT_FIELD_CAPS = {
+    "title": 500,
+    "summary": 100_000,
+    "list_item": 1_000,
+}
+_MAX_SESSIONS_PER_FILE = 10_000
+_MAX_IMPORT_BYTES = 50 * 1024 * 1024  # 50 MB
+_INTERNAL_SOURCES = ("file_memory", "periodic")
+
+_TAG_RATE_WINDOW = 60.0   # seconds per rate-limit window
+_TAG_RATE_MAX = 20        # max tag_as_anti_pattern calls per window
+
+# Agent context injection (SH-12766)
+MAX_TOPICS_PER_CONFIG = 10
+_AGENT_CONTEXT_TOPIC_MAX_LEN = 200
+_AGENT_NAME_RE = re.compile(r'^[a-z][a-z0-9-]{1,63}$')
+_AGENT_CONTEXT_PROJECT_RE = re.compile(r'^[a-z_][a-z0-9_]{0,63}$')
+
+_STOPWORDS = frozenset({
+    "a", "about", "after", "again", "ago", "all", "also", "an", "and",
+    "any", "are", "as", "at", "be", "been", "being", "but", "by", "can",
+    "could", "did", "do", "does", "done", "down", "during", "each",
+    "either", "every", "few", "for", "from", "get", "got", "had", "has",
+    "have", "he", "her", "here", "him", "his", "how", "i", "if", "in",
+    "into", "is", "it", "its", "just", "like", "may", "me", "more",
+    "most", "my", "neither", "new", "no", "nor", "not", "now", "of",
+    "off", "on", "once", "only", "or", "other", "our", "out", "over",
+    "own", "per", "run", "s", "set", "she", "so", "some", "such", "t",
+    "than", "that", "the", "their", "them", "then", "there", "these",
+    "they", "this", "those", "through", "to", "too", "under", "up",
+    "use", "used", "was", "we", "were", "what", "when", "where", "which",
+    "while", "who", "will", "with", "would", "yet", "you", "your",
+})
+
+
+class SessionLimitReachedError(Exception):
+    """Raised when the free-tier session limit is reached.
+
+    The BSL 1.1 Additional Use Grant allows personal/non-commercial use
+    up to 50 sessions. Exceeding this requires a Pro license.
+    """
+    pass
+
+
+def _validate_anti_pattern_schema(conn: sqlite3.Connection) -> None:
+    """Validate anti_pattern_sessions schema at startup. Raises RuntimeError on mismatch.
+
+    Checks column presence, PRIMARY KEY structure, FK existence, and FK enforcement.
+    Called after CREATE TABLE IF NOT EXISTS so a fresh database always passes.
+    """
+    EXPECTED_COLS = {"session_id": "TEXT", "tagged_at": "TEXT", "source": "TEXT"}
+    cols_info = conn.execute("PRAGMA table_info(anti_pattern_sessions)").fetchall()
+    actual_by_name = {row[1]: row for row in cols_info}
+
+    for col in EXPECTED_COLS:
+        if col not in actual_by_name:
+            row_count = conn.execute(
+                "SELECT COUNT(*) FROM anti_pattern_sessions"
+            ).fetchone()[0]
+            backup_sql = (
+                "CREATE TABLE anti_pattern_sessions_bak AS SELECT * FROM anti_pattern_sessions; "
+                if row_count > 0 else "(table is empty -- safe to drop without backup)"
+            )
+            raise RuntimeError(
+                f"anti_pattern_sessions schema mismatch: missing column '{col}'. "
+                f"Found columns: {list(actual_by_name.keys())}. "
+                f"Row count: {row_count}. "
+                f"Backup if needed: {backup_sql} "
+                f"Then: DROP TABLE anti_pattern_sessions; and restart."
+            )
+
+    pk_cols = [row[1] for row in cols_info if row[5] > 0]
+    if pk_cols != ['session_id']:
+        row_count = conn.execute(
+            "SELECT COUNT(*) FROM anti_pattern_sessions"
+        ).fetchone()[0]
+        if row_count == 0:
+            conn.execute("DROP TABLE anti_pattern_sessions")
+            conn.executescript("""
+                CREATE TABLE anti_pattern_sessions (
+                    session_id TEXT NOT NULL,
+                    tagged_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                    source     TEXT NOT NULL DEFAULT 'unknown',
+                    PRIMARY KEY (session_id),
+                    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_anti_pattern_tagged_at
+                    ON anti_pattern_sessions (tagged_at DESC);
+            """)
+            logger.warning("auto-migrated empty anti_pattern_sessions table to v0.8.0 schema")
+            return
+        raise RuntimeError(
+            f"anti_pattern_sessions PRIMARY KEY mismatch. "
+            f"Expected pk=['session_id'], got pk={pk_cols}. "
+            f"Row count: {row_count}. "
+            "Backup: CREATE TABLE anti_pattern_sessions_bak AS SELECT * FROM anti_pattern_sessions; "
+            "DROP TABLE anti_pattern_sessions; then restart to recreate."
+        )
+
+    fk_list = conn.execute("PRAGMA foreign_key_list(anti_pattern_sessions)").fetchall()
+    fk_cascade = [
+        r for r in fk_list
+        if r[2] == 'sessions' and r[3] == 'session_id'
+        and r[4] == 'id' and r[6] == 'CASCADE'
+    ]
+    if not fk_cascade:
+        row_count = conn.execute(
+            "SELECT COUNT(*) FROM anti_pattern_sessions"
+        ).fetchone()[0]
+        if row_count == 0:
+            conn.execute("DROP TABLE anti_pattern_sessions")
+            conn.executescript("""
+                CREATE TABLE anti_pattern_sessions (
+                    session_id TEXT NOT NULL,
+                    tagged_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                    source     TEXT NOT NULL DEFAULT 'unknown',
+                    PRIMARY KEY (session_id),
+                    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_anti_pattern_tagged_at
+                    ON anti_pattern_sessions (tagged_at DESC);
+            """)
+            logger.warning("auto-migrated empty anti_pattern_sessions table to v0.8.0 schema (FK)")
+            return
+        recreate_ddl = (
+            "CREATE TABLE anti_pattern_sessions ("
+            "session_id TEXT NOT NULL, "
+            "tagged_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')), "
+            "source TEXT NOT NULL DEFAULT 'unknown', "
+            "PRIMARY KEY (session_id), "
+            "FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE);"
+        )
+        backup_clause = (
+            "Backup: CREATE TABLE anti_pattern_sessions_bak AS SELECT * FROM anti_pattern_sessions; "
+            if row_count > 0 else "(table is empty -- safe to drop without backup) "
+        )
+        raise RuntimeError(
+            "anti_pattern_sessions missing FOREIGN KEY to sessions(id) ON DELETE CASCADE. "
+            f"Row count: {row_count}. "
+            f"{backup_clause}"
+            f"DROP TABLE anti_pattern_sessions; {recreate_ddl} then restart."
+        )
+
+    fk_status = conn.execute("PRAGMA foreign_keys").fetchone()
+    if not fk_status or fk_status[0] != 1:
+        raise RuntimeError(
+            "PRAGMA foreign_keys = ON failed to take effect after _open_conn(). "
+            "Check _open_conn() in database.py -- it must call "
+            "conn.execute('PRAGMA foreign_keys = ON') before returning."
+        )
+
+
+
+class SessionDatabase:
+    def __init__(self, config: Optional[Config] = None):
+        self.config = config or Config()
+        self.config.ensure_db_dir()
+        # In-process write serialization for multi-statement mutations. Also
+        # guards reopening self._conn so the idle watchdog's release cannot
+        # close it out from under an in-flight write (see release_idle_connection).
+        self._write_lock = threading.Lock()
+        # _open_conn() sets isolation_level=None, WAL, busy_timeout=10000,
+        # foreign_keys=ON, check_same_thread=False, row_factory=Row.
+        self._conn = _open_conn(self.config.db_path)
+        self._register_connection_functions(self._conn)
+        # True only after an explicit close() -- distinguishes a terminal
+        # close from an idle-watchdog release, which must keep reopening.
+        self._closed = False
+        self._lance_index = None  # lazy init; LanceIndex instance when Pro
+        self._rebuild_state: dict = {}  # background rebuild progress (see rebuild_lance_index)
+        self._rebuild_lock = threading.Lock()  # guards _rebuild_state reads/writes
+        self._rebuild_thread: Optional[threading.Thread] = None
+        _check_shared_environment_warning()
+        _check_network_filesystem_warning(str(self.config.db_path))
+        self._init_schema()
+
+    @property
+    def conn(self) -> sqlite3.Connection:
+        """The live connection, reopened lazily if idle-released.
+
+        Fast path reads self._conn without the lock (a plain attribute read/
+        write is atomic under the GIL); the lock is only needed to reopen.
+        This leaves a narrow window where a reader can be handed a connection
+        that the watchdog closes a moment later -- accepted the same way the
+        wedged-writer risk is documented in loreconvo's CLAUDE.md, since
+        closing the window fully would require every read call site to hold
+        _write_lock for its whole duration.
+        """
+        conn = self._conn
+        if conn is not None:
+            return conn
+        with self._write_lock:
+            return self._ensure_conn_locked()
+
+    @conn.setter
+    def conn(self, value):
+        self._conn = value
+
+    def _ensure_conn_locked(self) -> sqlite3.Connection:
+        """Return the live connection, opening one if needed.
+
+        Caller must already hold self._write_lock. Raises if close() was
+        called -- a terminal close never reopens; only the idle-watchdog's
+        release_idle_connection() does.
+        """
+        if self._closed:
+            raise sqlite3.ProgrammingError(
+                "Cannot operate on a closed SessionDatabase; construct a new instance."
+            )
+        if self._conn is None:
+            self._conn = _open_conn(self.config.db_path)
+            self._register_connection_functions(self._conn)
+        return self._conn
+
+    @staticmethod
+    def _register_connection_functions(conn: sqlite3.Connection) -> None:
+        conn.create_function(
+            "loreconvo_tag_matches",
+            2,
+            lambda stored, requested: int(
+                requested in SessionDatabase._parse_json_field(stored)
+            ),
+            deterministic=True,
+        )
+
+    def release_idle_connection(self) -> None:
+        """Close the connection to release the sqlite write lock while idle.
+
+        Called by the idle watchdog instead of exiting the process (SH-13610):
+        exiting a stdio server that a client parks (rather than re-spawns) left
+        Claude Code/Desktop with a permanently dead MCP connection. Closing the
+        connection still rolls back any dangling write transaction and releases
+        the write lock -- the original purpose of the watchdog (SH-12881) --
+        without killing the process. Blocks on _write_lock so it can never
+        close a connection mid-transaction; the next access reopens lazily via
+        the `conn` property / _write_context.
+        """
+        with self._write_lock:
+            if self._conn is not None:
+                self._conn.close()
+                self._conn = None
+
+    def _init_schema(self):
+        self.conn.executescript(SCHEMA_SQL)
+        self._migrate_fts_v2()
+        self._migrate_add_source_column()
+        self._migrate_add_team_memory_columns()
+        self._migrate_add_external_tool_session_column()
+        self._migrate_index_existing_cooccurrences()
+        self._migrate_add_dreaming_columns()
+        self._migrate_add_digest_safety_columns()
+        self._migrate_add_reasoning_notes_column()
+        self._migrate_fts_v3()
+        self._migrate_add_project_instructions_column()
+        self._migrate_add_previous_summary_column()
+        self._migrate_add_summary_source_columns()
+        self._migrate_add_cross_product_columns()
+        self._migrate_add_cascade_fks()
+        self._migrate_add_skill_position_column()
+        # LAST among the migrations on purpose: any earlier step that recreates
+        # the sessions table or its triggers is repaired by this one (SH-13438).
+        self._migrate_fts_v4_external_content_triggers()
+        if getattr(self, "_fts_created_over_rows", False):
+            self.conn.execute("INSERT INTO sessions_fts(sessions_fts) VALUES('rebuild')")
+            self.conn.commit()
+            self._fts_created_over_rows = False
+        self.conn.executescript(ANTI_PATTERN_SCHEMA_SQL)
+        _validate_anti_pattern_schema(self.conn)
+        self._sweep_anti_pattern_orphans()
+        self._sweep_cooccurrence_orphans()
+        self._ensure_keep_forever_schema()
+        self._migrate_add_agent_context_configs()
+        self._migrate_add_memory_items_table()
+        self._migrate_normalize_start_date_utc()
+        # Migration: clean up any rows with NULL id (bug where raw SQL
+        # inserts bypassed the Session dataclass UUID generation).
+        null_rows = self.conn.execute(
+            "SELECT rowid, title FROM sessions WHERE id IS NULL"
+        ).fetchall()
+        if null_rows:
+            import uuid
+            for row in null_rows:
+                new_id = str(uuid.uuid4())
+                self.conn.execute(
+                    "UPDATE sessions SET id = ? WHERE rowid = ?",
+                    (new_id, row['rowid'])
+                )
+            self.conn.commit()
+        self._migrate_normalize_project_names()
+
+    def _migrate_normalize_project_names(self):
+        """Normalize all existing project names (SH-103918).
+
+        Reads every distinct non-None project value, computes its canonical
+        form via normalize_project_name(), and UPDATEs rows where it differs.
+        Idempotent: normalizing an already-normalized name is a no-op.
+        """
+        rows = self.conn.execute(
+            "SELECT DISTINCT project FROM sessions WHERE project IS NOT NULL"
+        ).fetchall()
+        changes = 0
+        for row in rows:
+            original = row["project"]
+            normalized = normalize_project_name(original)
+            if normalized is None or normalized == original:
+                continue
+            self.conn.execute(
+                "UPDATE sessions SET project = ? WHERE project = ?",
+                (normalized, original),
+            )
+            changes += 1
+            logger.info(
+                "migrate_normalize_project_names: %s -> %s", original, normalized
+            )
+        if changes:
+            self.conn.commit()
+            logger.info(
+                "migrate_normalize_project_names: total groups normalized = %d",
+                changes,
+            )
+
+    def _migrate_add_agent_context_configs(self):
+        """Create agent_context_configs table (SH-12766, agent context injection).
+
+        One row per (agent_name, project) pair; topics stored as a JSON array
+        column (bounded at MAX_TOPICS_PER_CONFIG). Idempotent: CREATE TABLE/INDEX
+        IF NOT EXISTS, run unconditionally on every startup -- no PRAGMA
+        user_version gate. This deliberately diverges from the architecture
+        proposal's version-gated design (SH-12766 disposition, migration HIGH
+        findings): a version short-circuit can skip table creation if some other
+        component bumped user_version first, leaving agent_context_configs
+        missing despite the DB reporting itself "migrated." Following this
+        file's existing unconditional-idempotent _migrate_* convention instead
+        avoids that failure mode entirely.
+        """
+        self.conn.executescript("""
+            CREATE TABLE IF NOT EXISTS agent_context_configs (
+                agent_name            TEXT NOT NULL,
+                project               TEXT NOT NULL,
+                topics_json           TEXT NOT NULL DEFAULT '[]',
+                max_results_per_topic INTEGER NOT NULL DEFAULT 3
+                                          CHECK (max_results_per_topic BETWEEN 1 AND 10),
+                enabled               INTEGER NOT NULL DEFAULT 1
+                                          CHECK (enabled IN (0, 1)),
+                status                TEXT NOT NULL DEFAULT 'active'
+                                          CHECK (status IN ('active', 'retired')),
+                last_used_at          TEXT,
+                retired_at            TEXT,
+                created_at            TEXT NOT NULL
+                                          DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                updated_at            TEXT NOT NULL
+                                          DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                PRIMARY KEY (agent_name, project)
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_context_configs_project
+                ON agent_context_configs(project, enabled);
+        """)
+        self.conn.commit()
+
+    def _migrate_add_memory_items_table(self):
+        """Create memory_items table + indexes (SH-12768, structured memory layer r4).
+
+        Unconditional idempotent CREATE TABLE/INDEX IF NOT EXISTS, run on every
+        startup -- the same convention as _migrate_add_agent_context_configs
+        (SH-12766), not the schema_migration_log-gated apply/rollback design
+        in the architecture proposal (SH-12363 r4). That gated design was
+        rejected here for the same reason SH-12766 rejected it: a version
+        short-circuit can skip table creation if some other component wrote
+        the gate row first, leaving the table missing despite the DB reporting
+        itself "migrated." No rollback function is added either, matching
+        every other _migrate_* in this file -- these are additive-only.
+
+        Degrades gracefully instead of blocking the whole feature: if this
+        SQLite build predates json1 (<3.38.0) memory_items is left disabled
+        entirely; if FTS5 is unavailable the table/indexes are still created
+        and CRUD works, only full-text search over items is disabled.
+        [SH-12768 r4 migration HIGH: "FTS5 prerequisite check blocks entire
+        0.8.0 feature with no degraded mode"]
+
+        PRAGMA foreign_keys=ON is already set for every connection in
+        _open_conn(), so session_id/closed_by_session_id FK enforcement is
+        active without any extra setup here. [r4 HIGH #8]
+        """
+        self._memory_items_available = False
+        self._memory_items_fts_available = False
+
+        version = tuple(
+            int(x) for x in
+            self.conn.execute("SELECT sqlite_version()").fetchone()[0].split(".")
+        )
+        if version < (3, 38, 0):
+            logger.warning(
+                "SQLite %s is older than 3.38.0 (no json_valid()): structured "
+                "memory items (decisions/questions/artifacts) are disabled on "
+                "this installation.",
+                ".".join(str(p) for p in version),
+            )
+            return
+
+        self.conn.executescript("""
+            CREATE TABLE IF NOT EXISTS memory_items (
+                id                   TEXT NOT NULL
+                                     CHECK(
+                                       length(id) = 36
+                                       AND substr(id, 9, 1) = '-'
+                                       AND substr(id, 14, 1) = '-'
+                                       AND substr(id, 19, 1) = '-'
+                                       AND substr(id, 24, 1) = '-'
+                                       AND id = lower(id)
+                                     ),
+                item_type            TEXT NOT NULL
+                                     CHECK(item_type IN ('decision','open_question','artifact')),
+                session_id           TEXT REFERENCES sessions(id) ON DELETE SET NULL,
+                project              TEXT NOT NULL DEFAULT 'unspecified',
+                tags                 TEXT NOT NULL DEFAULT '[]'
+                                     CHECK(json_valid(tags) AND tags LIKE '[%]'),
+                metadata             TEXT NOT NULL DEFAULT '{}'
+                                     CHECK(json_valid(metadata)),
+                title                TEXT NOT NULL,
+                body                 TEXT,
+                status               TEXT NOT NULL
+                                     CHECK(
+                                       (item_type = 'decision'      AND status IN ('active','retired'))
+                                       OR (item_type = 'open_question' AND status IN ('open','answered','wont-answer'))
+                                       OR (item_type = 'artifact'      AND status IN ('active','archived'))
+                                     ),
+                external_id          TEXT,
+                closed_at            TEXT,
+                closed_reason        TEXT,
+                closed_by_session_id TEXT REFERENCES sessions(id) ON DELETE SET NULL,
+                created_at           TEXT NOT NULL,
+                updated_at           TEXT NOT NULL,
+                PRIMARY KEY (id),
+                CHECK(closed_by_session_id IS NULL OR closed_at IS NOT NULL),
+                UNIQUE (project, external_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_memory_items_project_type_status
+                ON memory_items(project, item_type, status);
+            CREATE INDEX IF NOT EXISTS idx_memory_items_session_id
+                ON memory_items(session_id);
+            CREATE INDEX IF NOT EXISTS idx_memory_items_project_external_id
+                ON memory_items(project, external_id)
+                WHERE external_id IS NOT NULL;
+        """)
+        self._memory_items_available = True
+
+        try:
+            self.conn.executescript("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS memory_items_fts USING fts5(
+                title, body, tags,
+                content=memory_items,
+                content_rowid=rowid
+            );
+            CREATE TRIGGER IF NOT EXISTS after_insert_memory_items
+                AFTER INSERT ON memory_items BEGIN
+                    INSERT INTO memory_items_fts(rowid, title, body, tags)
+                    VALUES (new.rowid, new.title, new.body, new.tags);
+                END;
+            CREATE TRIGGER IF NOT EXISTS after_delete_memory_items
+                AFTER DELETE ON memory_items BEGIN
+                    INSERT INTO memory_items_fts(memory_items_fts, rowid, title, body, tags)
+                    VALUES ('delete', old.rowid, old.title, old.body, old.tags);
+                END;
+            CREATE TRIGGER IF NOT EXISTS after_update_memory_items
+                AFTER UPDATE ON memory_items BEGIN
+                    INSERT INTO memory_items_fts(memory_items_fts, rowid, title, body, tags)
+                    VALUES ('delete', old.rowid, old.title, old.body, old.tags);
+                    INSERT INTO memory_items_fts(rowid, title, body, tags)
+                    VALUES (new.rowid, new.title, new.body, new.tags);
+                END;
+        """)
+        except Exception:
+            logger.warning(
+                "SQLite FTS5 extension is not available: memory_items "
+                "full-text search is disabled on this installation "
+                "(save/query/transition/update still work)."
+            )
+            return
+        self._memory_items_fts_available = True
+
+    def _migrate_normalize_start_date_utc(self):
+        """Normalize legacy naive-local start_date to UTC+Z format (SH-100303 r4).
+
+        One-time backfill: converts sessions.start_date values lacking timezone
+        designators using the machine's current local offset. Idempotent.
+        """
+        try:
+            unnormalized_count = self.conn.execute("""
+                SELECT COUNT(*) FROM sessions
+                WHERE start_date NOT LIKE '%Z'
+                  AND start_date NOT GLOB '*[+-][0-9][0-9]:[0-9][0-9]'
+            """).fetchone()[0]
+
+            if unnormalized_count == 0:
+                return
+
+            offset_str = datetime.now().astimezone().strftime('%z')
+            offset_formatted = f"{offset_str[:-2]}:{offset_str[-2:]}"
+
+            # Appending the offset makes the value offset-aware, which SQLite
+            # converts to UTC on its own. A trailing ' UTC' does NOT work here:
+            # 'utc' is a modifier argument, and concatenating it into the time
+            # string makes the whole string unparseable, so strftime returns
+            # NULL for every row (SH-100511).
+            #
+            # Rows that still do not parse (malformed or date-only values) are
+            # skipped by the IS NOT NULL guard rather than written as NULL --
+            # without it one bad row aborts the entire migration on the
+            # sessions.start_date NOT NULL constraint, and would blank out an
+            # otherwise valid end_date/updated_at.
+            start_date_cursor = self.conn.execute("""
+                UPDATE sessions
+                SET start_date = strftime('%Y-%m-%dT%H:%M:%SZ', start_date || ?)
+                WHERE start_date NOT LIKE '%Z'
+                  AND start_date NOT GLOB '*[+-][0-9][0-9]:[0-9][0-9]'
+                  AND strftime('%Y-%m-%dT%H:%M:%SZ', start_date || ?) IS NOT NULL
+            """, (offset_formatted, offset_formatted))
+            converted_count = start_date_cursor.rowcount
+
+            self.conn.execute("""
+                UPDATE sessions
+                SET end_date = strftime('%Y-%m-%dT%H:%M:%SZ', end_date || ?)
+                WHERE end_date IS NOT NULL
+                  AND end_date NOT LIKE '%Z'
+                  AND end_date NOT GLOB '*[+-][0-9][0-9]:[0-9][0-9]'
+                  AND strftime('%Y-%m-%dT%H:%M:%SZ', end_date || ?) IS NOT NULL
+            """, (offset_formatted, offset_formatted))
+
+            # NOTE (SH-100303 r4 HIGH disposition): the `sessions` table has no
+            # `updated_at` column -- verified against storage_core.py's schema.
+            # The architecture proposal conflated it with memory_digests.updated_at,
+            # a separate table. An UPDATE against sessions.updated_at was removed
+            # here: it always raised sqlite3.OperationalError, which the
+            # top-level except swallowed silently, aborting this method before
+            # the audit-log write below ever ran (isolation_level=None means the
+            # start_date/end_date UPDATEs above still committed individually).
+
+            # Records the one unrecoverable assumption this migration makes --
+            # a naive-local row's original offset cannot be known, so the
+            # machine's current offset stands in for it (SH-100303 r4 HIGH
+            # disposition: "the assumed offset is recorded, not hidden").
+            self.conn.execute("""
+                INSERT OR REPLACE INTO schema_migration_log
+                    (migration_name, from_version, to_version)
+                VALUES (?, ?, ?)
+            """, (
+                "normalize_start_date_utc",
+                "naive-local (assumed offset unknown)",
+                f"utc+z (assumed_offset={offset_formatted}, converted={converted_count})",
+            ))
+
+            self.conn.commit()
+
+        except Exception as e:
+            logger.error(f"Migration _migrate_normalize_start_date_utc failed: {e}")
+
+    def _migrate_fts_v2(self):
+        """Migrate FTS5 index to v2: add tags and open_questions columns.
+
+        The original FTS5 table indexed only (title, summary, decisions).
+        v2 adds (tags, open_questions) so searches match tag keywords and
+        unresolved questions. This runs on every startup but only rebuilds
+        once -- after that the IF NOT EXISTS in FTS_SQL is a no-op.
+        """
+        needs_rebuild = False
+        try:
+            cursor = self.conn.execute("SELECT * FROM sessions_fts LIMIT 0")
+            col_names = [desc[0] for desc in cursor.description]
+            if 'tags' not in col_names:
+                needs_rebuild = True
+        except sqlite3.OperationalError:
+            # FTS table does not exist yet -- fresh install, just create it
+            needs_rebuild = False
+            self.conn.executescript(FTS_SQL)
+            self.conn.executescript(FTS_TRIGGERS)
+            # SH-103036: a sessions table that predates sessions_fts already
+            # has rows; an empty external-content index makes the first UPDATE
+            # fire 'delete' for never-indexed rows -> "malformed". The rebuild
+            # runs in _init_schema once every indexed column exists.
+            self._fts_created_over_rows = self.conn.execute(
+                "SELECT 1 FROM sessions LIMIT 1"
+            ).fetchone() is not None
+            return
+
+        if not needs_rebuild:
+            # Already on v2 schema -- ensure triggers exist (idempotent)
+            self.conn.executescript(FTS_SQL)
+            self.conn.executescript(FTS_TRIGGERS)
+            return
+
+        # --- Rebuild: drop old FTS table and triggers, recreate with v2 schema ---
+        self.conn.executescript("""
+            DROP TRIGGER IF EXISTS sessions_ai;
+            DROP TRIGGER IF EXISTS sessions_au;
+            DROP TRIGGER IF EXISTS sessions_ad;
+            DROP TABLE IF EXISTS sessions_fts;
+        """)
+
+        # Create the new FTS5 table with expanded columns
+        self.conn.executescript(FTS_SQL)
+
+        # Repopulate from existing sessions
+        self.conn.execute("""
+            INSERT INTO sessions_fts(rowid, title, summary, decisions, tags, open_questions)
+            SELECT rowid, title, summary, decisions, tags, open_questions
+            FROM sessions
+        """)
+
+        # Recreate triggers for the new column set
+        self.conn.executescript(FTS_TRIGGERS)
+
+    def _migrate_add_source_column(self):
+        """Add 'source' column to sessions table if not already present.
+
+        Backward-compatible: existing rows default to 'session'.
+        SQLite raises OperationalError on duplicate column add -- that's the
+        signal that migration already ran.
+        """
+        try:
+            self.conn.execute(
+                "ALTER TABLE sessions ADD COLUMN source TEXT DEFAULT 'session'"
+            )
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
+    def _migrate_add_team_memory_columns(self):
+        """Add shared_by, origin_machine, content_hash columns for v0.4.0 team memory.
+
+        Idempotent: each ALTER TABLE is wrapped in try/except for the duplicate-column
+        OperationalError that SQLite raises when the column already exists.
+        """
+        for col_sql in (
+            "ALTER TABLE sessions ADD COLUMN shared_by TEXT",
+            "ALTER TABLE sessions ADD COLUMN origin_machine TEXT",
+            "ALTER TABLE sessions ADD COLUMN content_hash TEXT",
+        ):
+            try:
+                self.conn.execute(col_sql)
+            except sqlite3.OperationalError:
+                pass  # column already exists
+
+    def _migrate_add_external_tool_session_column(self):
+        """Add external_tool_session column for contamination control (RON-00115).
+
+        Idempotent: wrapped in try/except for duplicate-column OperationalError.
+        """
+        try:
+            self.conn.execute(
+                "ALTER TABLE sessions ADD COLUMN external_tool_session INTEGER DEFAULT 0"
+            )
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
+    def _migrate_add_reasoning_notes_column(self):
+        """Add reasoning_notes column to sessions table if not already present.
+
+        Idempotent: SQLite raises OperationalError on duplicate column add.
+        """
+        try:
+            self.conn.execute(
+                "ALTER TABLE sessions ADD COLUMN reasoning_notes TEXT"
+            )
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
+    def _migrate_fts_v3(self):
+        """Migrate FTS5 index to v3: add reasoning_notes column.
+
+        Follows the same rebuild pattern as _migrate_fts_v2.
+        Must be called after _migrate_add_reasoning_notes_column so the column exists.
+        """
+        needs_rebuild = False
+        try:
+            cursor = self.conn.execute("SELECT * FROM sessions_fts LIMIT 0")
+            col_names = [desc[0] for desc in cursor.description]
+            if 'reasoning_notes' not in col_names:
+                needs_rebuild = True
+        except sqlite3.OperationalError:
+            needs_rebuild = False
+            self.conn.executescript(FTS_SQL)
+            self.conn.executescript(FTS_TRIGGERS)
+            return
+
+        if not needs_rebuild:
+            self.conn.executescript(FTS_SQL)
+            self.conn.executescript(FTS_TRIGGERS)
+            return
+
+        self.conn.executescript("""
+            DROP TRIGGER IF EXISTS sessions_ai;
+            DROP TRIGGER IF EXISTS sessions_au;
+            DROP TRIGGER IF EXISTS sessions_ad;
+            DROP TABLE IF EXISTS sessions_fts;
+        """)
+        self.conn.executescript(FTS_SQL)
+        self.conn.execute("""
+            INSERT INTO sessions_fts(rowid, title, summary, decisions, tags, open_questions, reasoning_notes)
+            SELECT rowid, title, summary, decisions, tags, open_questions, reasoning_notes
+            FROM sessions
+        """)
+        self.conn.executescript(FTS_TRIGGERS)
+
+    def _migrate_fts_v4_external_content_triggers(self):
+        """Repair FTS5 external-content triggers on EXISTING databases (SH-13438).
+
+        FTS_TRIGGERS uses CREATE TRIGGER IF NOT EXISTS, so shipping the corrected
+        constant fixes only NEWLY created databases -- every already-installed DB
+        keeps its broken trigger bodies forever. This migration force-replaces
+        them and rebuilds the index to discard tokens the old sessions_ad already
+        orphaned (one per re-save, for the life of the product).
+
+        Detection is on the trigger BODY, not a version counter: the defect
+        predates any schema-version marker, and the body is the ground truth.
+        Idempotent -- a DB whose triggers already carry the 'delete' command is
+        left untouched, so this costs one sqlite_master read on normal startup.
+        """
+        try:
+            rows = self.conn.execute(
+                "SELECT name, sql FROM sqlite_master "
+                "WHERE type = 'trigger' AND name IN ('sessions_au', 'sessions_ad')"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return  # no schema yet; _init_schema creates the correct form
+
+        if not rows:
+            return
+
+        legacy = [r for r in rows if r[1] and "'delete'" not in r[1]]
+        if not legacy:
+            return
+
+        logger.info(
+            "Migrating %d FTS5 trigger(s) to the external-content form and "
+            "rebuilding the index (SH-13438).", len(legacy)
+        )
+        self.conn.executescript("""
+            DROP TRIGGER IF EXISTS sessions_ai;
+            DROP TRIGGER IF EXISTS sessions_au;
+            DROP TRIGGER IF EXISTS sessions_ad;
+        """)
+        self.conn.executescript(FTS_TRIGGERS)
+        # Discard everything the broken triggers left behind. 'rebuild'
+        # regenerates the whole index from the content table, so orphaned rows
+        # and stale tokens both go away.
+        self.conn.execute("INSERT INTO sessions_fts(sessions_fts) VALUES('rebuild')")
+        self.conn.commit()
+
+    def _migrate_add_dreaming_columns(self):
+        """Add dreaming/recall columns and memory_digests table (v0.6.0).
+
+        Idempotent: each ALTER TABLE is wrapped in try/except for the duplicate-column
+        OperationalError that SQLite raises when the column already exists.
+        """
+        self.conn.executescript(DREAMING_SCHEMA_SQL)
+        for col_sql in (
+            "ALTER TABLE sessions ADD COLUMN expires_at TEXT",
+            "ALTER TABLE sessions ADD COLUMN staleness_hint TEXT",
+        ):
+            try:
+                self.conn.execute(col_sql)
+            except sqlite3.OperationalError:
+                pass  # column already exists
+
+    def _migrate_add_digest_safety_columns(self):
+        """Add source provenance used to reject unsafe memory digests."""
+        cols = {
+            row[1] for row in self.conn.execute("PRAGMA table_info(memory_digests)")
+        }
+        if "source_session_ids" not in cols:
+            self.conn.execute(
+                "ALTER TABLE memory_digests ADD COLUMN source_session_ids TEXT"
+            )
+        if "safety_invalidated" not in cols:
+            self.conn.execute(
+                "ALTER TABLE memory_digests "
+                "ADD COLUMN safety_invalidated INTEGER DEFAULT 0"
+            )
+        self.conn.commit()
+
+    def _migrate_add_project_instructions_column(self):
+        """Add instructions TEXT column to projects table.
+
+        Idempotent: wrapped in try/except for duplicate-column OperationalError.
+        """
+        try:
+            self.conn.execute(
+                "ALTER TABLE projects ADD COLUMN instructions TEXT"
+            )
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
+    def _migrate_add_previous_summary_column(self):
+        """Add previous_summary column for session version history (SH-10398).
+
+        Idempotent: uses PRAGMA table_info to skip if column already exists.
+        Not indexed in FTS5 -- audit field, not search field.
+        """
+        cols = {row[1] for row in self.conn.execute("PRAGMA table_info(sessions)")}
+        if "previous_summary" not in cols:
+            self.conn.execute(
+                "ALTER TABLE sessions ADD COLUMN previous_summary TEXT"
+            )
+            self.conn.commit()
+
+    def _migrate_add_summary_source_columns(self):
+        """Add async summarization columns and support tables (SH-10723, v0.7.0).
+
+        New sessions columns: summary_source, summary_retry_count, fallback_reason.
+        New tables: cap_state (daily API call budget), schema_migration_log.
+
+        summary_source values: heuristic, summary_pending, claude_api,
+                               claude_async, permanently_heuristic
+        Idempotent: column adds wrapped in try/except; tables use IF NOT EXISTS.
+        """
+        for col_sql in (
+            "ALTER TABLE sessions ADD COLUMN summary_source TEXT DEFAULT 'heuristic'",
+            "ALTER TABLE sessions ADD COLUMN summary_retry_count INTEGER DEFAULT 0",
+            "ALTER TABLE sessions ADD COLUMN fallback_reason TEXT",
+        ):
+            try:
+                self.conn.execute(col_sql)
+            except sqlite3.OperationalError:
+                pass  # column already exists
+
+        # Backfill: existing rows with a summary are pre_migration_unknown.
+        # Pre-v0.7.0 summaries may be LLM-quality (from v0.5.1 save_session(summarize=True))
+        # or heuristic; we cannot distinguish reliably. Use 'pre_migration_unknown'
+        # and do not re-summarize unless user explicitly upgrades via save_session(summarize=True).
+        self.conn.execute(
+            "UPDATE sessions SET summary_source='pre_migration_unknown' "
+            "WHERE summary_source IS NULL AND summary IS NOT NULL"
+        )
+
+        self.conn.executescript("""
+            CREATE TABLE IF NOT EXISTS cap_state (
+                date            TEXT PRIMARY KEY,
+                calls_today     INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS schema_migration_log (
+                migration_name  TEXT PRIMARY KEY,
+                applied_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                from_version    TEXT,
+                to_version      TEXT
+            );
+        """)
+
+    def _migrate_add_cross_product_columns(self):
+        """Add Phase 2b cross-product linking columns to sessions (SH-10727, v0.7.1).
+
+        cross_link_opt_out: user can prevent this session from appearing in
+          cross-product links (soft suppression; links are filtered, not deleted).
+        last_cross_linked_at: debounce timestamp; save-triggered linking skips
+          sessions cross-linked within the last 10 minutes.
+        Both columns are idempotent (try/except on duplicate-column OperationalError).
+        """
+        for col_sql in (
+            "ALTER TABLE sessions ADD COLUMN cross_link_opt_out INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE sessions ADD COLUMN last_cross_linked_at TEXT DEFAULT NULL",
+        ):
+            try:
+                self.conn.execute(col_sql)
+            except sqlite3.OperationalError:
+                pass  # column already exists
+
+    def _migrate_add_cascade_fks(self):
+        """Add ON DELETE CASCADE to session_links, session_skills, persona_sessions (SH-12795).
+
+        Without CASCADE, prune_expired_sessions() fails with FK constraint errors
+        when linked/skilled sessions are deleted. This recreates those tables with
+        CASCADE directives. Idempotent: checks if migration already applied by
+        inspecting the table CREATE DDL for ON DELETE CASCADE.
+
+        If orphaned rows exist (FK references to deleted sessions), they are cleaned
+        up before migration to allow the new tables to be created with CASCADE.
+        """
+        try:
+            result = self.conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='session_links'"
+            ).fetchone()
+            if result and result[0] and 'ON DELETE CASCADE' in result[0]:
+                logger.info("Migration already applied: session_links has ON DELETE CASCADE")
+                return
+        except Exception as e:
+            logger.info(f"Error checking session_links migration status: {e}")
+
+        try:
+            logger.info("Starting migration to add ON DELETE CASCADE to foreign keys")
+
+            logger.info("Cleaning up stale migration tables if present")
+            self.conn.execute("DROP TABLE IF EXISTS session_links_new")
+            self.conn.execute("DROP TABLE IF EXISTS session_skills_new")
+            self.conn.execute("DROP TABLE IF EXISTS persona_sessions_new")
+
+            logger.info("Cleaning up orphaned rows in session_links")
+            self.conn.execute('''\
+                DELETE FROM session_links
+                WHERE from_session_id NOT IN (SELECT id FROM sessions)
+                   OR to_session_id NOT IN (SELECT id FROM sessions)
+            ''')
+
+            logger.info("Cleaning up orphaned rows in session_skills")
+            self.conn.execute('''\
+                DELETE FROM session_skills
+                WHERE session_id NOT IN (SELECT id FROM sessions)
+            ''')
+
+            logger.info("Cleaning up orphaned rows in persona_sessions")
+            self.conn.execute('''\
+                DELETE FROM persona_sessions
+                WHERE session_id NOT IN (SELECT id FROM sessions)
+            ''')
+
+            logger.info("Creating new session_links table with CASCADE")
+            self.conn.execute('''\
+                CREATE TABLE session_links_new (
+                    from_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    to_session_id   TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    link_type       TEXT DEFAULT 'continues',
+                    PRIMARY KEY (from_session_id, to_session_id)
+                )
+            ''')
+
+            logger.info("Creating new session_skills table with CASCADE")
+            self.conn.execute('''\
+                CREATE TABLE session_skills_new (
+                    session_id       TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    skill_name       TEXT NOT NULL,
+                    skill_source     TEXT,
+                    invocation_count INTEGER DEFAULT 1,
+                    PRIMARY KEY (session_id, skill_name)
+                )
+            ''')
+
+            logger.info("Creating new persona_sessions table with CASCADE")
+            self.conn.execute('''\
+                CREATE TABLE persona_sessions_new (
+                    persona_name    TEXT NOT NULL,
+                    session_id      TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    relevance_note  TEXT,
+                    PRIMARY KEY (persona_name, session_id)
+                )
+            ''')
+
+            logger.info("Copying data to session_links_new")
+            self.conn.execute('''\
+                INSERT INTO session_links_new
+                SELECT from_session_id, to_session_id, link_type
+                FROM session_links
+            ''')
+
+            logger.info("Copying data to session_skills_new")
+            self.conn.execute('''\
+                INSERT INTO session_skills_new
+                SELECT session_id, skill_name, skill_source, invocation_count
+                FROM session_skills
+            ''')
+
+            logger.info("Copying data to persona_sessions_new")
+            self.conn.execute('''\
+                INSERT INTO persona_sessions_new
+                SELECT persona_name, session_id, relevance_note
+                FROM persona_sessions
+            ''')
+
+            logger.info("Dropping old session_links table")
+            self.conn.execute('DROP TABLE session_links')
+
+            logger.info("Dropping old session_skills table")
+            self.conn.execute('DROP TABLE session_skills')
+
+            logger.info("Dropping old persona_sessions table")
+            self.conn.execute('DROP TABLE persona_sessions')
+
+            logger.info("Renaming session_links_new to session_links")
+            self.conn.execute('ALTER TABLE session_links_new RENAME TO session_links')
+
+            logger.info("Renaming session_skills_new to session_skills")
+            self.conn.execute('ALTER TABLE session_skills_new RENAME TO session_skills')
+
+            logger.info("Renaming persona_sessions_new to persona_sessions")
+            self.conn.execute('ALTER TABLE persona_sessions_new RENAME TO persona_sessions')
+
+            self.conn.commit()
+            logger.info("Migration completed successfully: ON DELETE CASCADE applied")
+
+        except Exception as e:
+            self.conn.rollback()
+            logger.error(f"Migration failed with error: {e}")
+            raise
+
+    def _migrate_add_skill_position_column(self):
+        """Add a `position` column to session_skills (SH-103920).
+
+        Preserves the order skills were used in. Without it, get_session
+        returns skills in alphabetical order because the query planner serves
+        the WHERE session_id=? lookup from the (session_id, skill_name)
+        primary-key index. Idempotent: no-op when the column already exists.
+        """
+        skill_cols = {
+            row[1] for row in self.conn.execute(
+                "PRAGMA table_info(session_skills)"
+            ).fetchall()
+        }
+        if "position" not in skill_cols:
+            self.conn.execute(
+                "ALTER TABLE session_skills "
+                "ADD COLUMN position INTEGER NOT NULL DEFAULT 0"
+            )
+            self.conn.commit()
+            logger.info("Migration: added session_skills.position column")
+
+    # -- keep_forever / session pinning (v0.8.1) --
+
+    def _keep_forever_schema_present(self) -> bool:
+        """Quick read-only check: True only if all keep_forever schema components
+        are present AND their bodies are valid.
+
+        Called before acquiring the EXCLUSIVE lock to avoid blocking short-lived
+        CLI invocations on every startup. Returns False on any error or body
+        mismatch (triggers slow path).
+        """
+        try:
+            rows = self.conn.execute("PRAGMA table_info(sessions)").fetchall()
+            if not any(row[1] == "keep_forever" for row in rows):
+                return False
+            view_row = self.conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='view' "
+                "AND name='sessions_prunable'"
+            ).fetchone()
+            if not view_row:
+                return False
+            view_sql = view_row[0] or ""
+            if "keep_forever" not in view_sql or "= 0" not in view_sql:
+                return False
+            bt_row = self.conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' "
+                "AND name='prevent_delete_pinned_sessions'"
+            ).fetchone()
+            if not bt_row:
+                return False
+            bt_sql = bt_row[0] or ""
+            if "RAISE(ABORT" not in bt_sql or "LORECONVO_PINNED_SESSION" not in bt_sql:
+                return False
+            iodt_row = self.conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' "
+                "AND name='sessions_prunable_delete'"
+            ).fetchone()
+            if not iodt_row:
+                return False
+            iodt_sql = iodt_row[0] or ""
+            if "keep_forever = 0" not in iodt_sql:
+                return False
+            return True
+        except Exception:
+            return False
+
+    def _ensure_keep_forever_schema(self) -> None:
+        """Ensure keep_forever column, view, index, and triggers exist. Idempotent.
+
+        Fast path: if _keep_forever_schema_present() returns True, returns
+        immediately without acquiring any lock.
+
+        Slow path: acquires BEGIN EXCLUSIVE for DDL serialization. EXCLUSIVE
+        failure raises RuntimeError immediately.
+        """
+        if self._keep_forever_schema_present():
+            return
+        saved_isolation = self.conn.isolation_level
+        self.conn.isolation_level = None
+        try:
+            try:
+                self.conn.execute("BEGIN EXCLUSIVE")
+            except Exception as exc:
+                raise RuntimeError(
+                    "LoreConvo: keep_forever migration failed to acquire exclusive lock. "
+                    "Another process may be holding the DB connection. "
+                    "Recovery: ensure no other LoreConvo processes are running, then restart. "
+                    "Path: " + str(self.config.db_path)
+                ) from exc
+            try:
+                self._run_keep_forever_migration()
+                self.conn.execute("COMMIT")
+            except Exception:
+                try:
+                    self.conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+        finally:
+            self.conn.isolation_level = saved_isolation
+
+    def _run_keep_forever_migration(self) -> None:
+        """Execute migration steps inside an already-open EXCLUSIVE transaction."""
+        rows = list(self.conn.execute("PRAGMA table_info(sessions)"))
+        if not rows:
+            raise RuntimeError(
+                "LoreConvo: sessions table not found. The database may be corrupted "
+                "or not a LoreConvo database. "
+                "Recovery: restore sessions.db from your most recent backup. "
+                "Path: " + str(self.config.db_path)
+            )
+        try:
+            self.conn.execute("SELECT COUNT(*) FROM sessions LIMIT 1").fetchone()
+        except sqlite3.DatabaseError as exc:
+            raise RuntimeError(
+                "LoreConvo: sessions table is inaccessible despite table_info returning "
+                "rows. The database may be partially corrupted. "
+                "Recovery: restore sessions.db from your most recent backup. "
+                "Path: " + str(self.config.db_path)
+            ) from exc
+
+        col_map = {row[1]: row for row in rows}
+        if "keep_forever" not in col_map:
+            self.conn.execute(
+                "ALTER TABLE sessions ADD COLUMN keep_forever INTEGER NOT NULL DEFAULT 0"
+            )
+        else:
+            row = col_map["keep_forever"]
+            if row[2].upper() != "INTEGER":
+                raise RuntimeError(
+                    "LoreConvo: keep_forever column has type {!r} (expected INTEGER). "
+                    "Schema modified by incompatible tool. "
+                    "Recovery: (1) back up sessions.db, "
+                    "(2) ALTER TABLE sessions RENAME COLUMN keep_forever TO keep_forever_old, "
+                    "(3) ALTER TABLE sessions ADD COLUMN keep_forever INTEGER NOT NULL DEFAULT 0, "
+                    "(4) UPDATE sessions SET keep_forever = "
+                    "CASE WHEN typeof(keep_forever_old)='integer' "
+                    "AND keep_forever_old IN (0,1) THEN keep_forever_old ELSE 0 END.".format(row[2])
+                )
+            if row[3] != 1 or str(row[4]).strip("'") != "0":
+                logger.warning(
+                    "keep_forever column has non-standard nullability=%s or default=%s; "
+                    "expected NOT NULL DEFAULT 0. Values coerced to 0/1 by application code.",
+                    row[3], row[4]
+                )
+
+        existing_indexes = {
+            r[0] for r in self.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            )
+        }
+        if "idx_sessions_keep_forever" not in existing_indexes:
+            _create_keep_forever_index(self.conn)
+
+        trigger_row = self.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' "
+            "AND name='prevent_delete_pinned_sessions'"
+        ).fetchone()
+        if trigger_row is None:
+            self.conn.execute(_CREATE_TRIGGER_SQL)
+        else:
+            sql_body = trigger_row[0] or ""
+            if "RAISE(ABORT" not in sql_body or "LORECONVO_PINNED_SESSION" not in sql_body:
+                logger.warning(
+                    "Trigger prevent_delete_pinned_sessions has unexpected body; recreating."
+                )
+                self.conn.execute("DROP TRIGGER prevent_delete_pinned_sessions")
+                self.conn.execute(_CREATE_TRIGGER_SQL)
+
+        view_row = self.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='view' AND name='sessions_prunable'"
+        ).fetchone()
+        if view_row is None:
+            self.conn.execute(_CREATE_SESSIONS_PRUNABLE_VIEW_SQL)
+        else:
+            view_sql = view_row[0] or ""
+            if "keep_forever" not in view_sql or "= 0" not in view_sql:
+                logger.warning(
+                    "sessions_prunable view has unexpected body; recreating."
+                )
+                self.conn.execute("DROP TRIGGER IF EXISTS sessions_prunable_delete")
+                self.conn.execute("DROP VIEW sessions_prunable")
+                self.conn.execute(_CREATE_SESSIONS_PRUNABLE_VIEW_SQL)
+
+        del_trigger_row = self.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' "
+            "AND name='sessions_prunable_delete'"
+        ).fetchone()
+        if del_trigger_row is None:
+            self.conn.execute(_CREATE_SESSIONS_PRUNABLE_DELETE_SQL)
+        else:
+            del_sql = del_trigger_row[0] or ""
+            if "keep_forever = 0" not in del_sql:
+                logger.warning(
+                    "sessions_prunable_delete trigger has unexpected body; recreating."
+                )
+                self.conn.execute("DROP TRIGGER sessions_prunable_delete")
+                self.conn.execute(_CREATE_SESSIONS_PRUNABLE_DELETE_SQL)
+
+        row = self.conn.execute(
+            "SELECT COUNT(*) FROM sessions WHERE keep_forever=1"
+        ).fetchone()
+        pinned_count = row[0] if row else 0
+        logger.info("keep_forever schema ready; %d session(s) pinned.", pinned_count)
+
+    def set_keep_forever(self, session_id: str, keep_forever: bool) -> bool:
+        """Set or clear keep_forever on a session. Returns False if not found.
+
+        When pinning: clears expires_at atomically in the same UPDATE.
+        When unpinning: leaves expires_at unchanged.
+        """
+        with self.conn:
+            if keep_forever:
+                cursor = self.conn.execute(
+                    "UPDATE sessions SET keep_forever=1, expires_at=NULL WHERE id=?",
+                    (session_id,),
+                )
+            else:
+                cursor = self.conn.execute(
+                    "UPDATE sessions SET keep_forever=0 WHERE id=?",
+                    (session_id,),
+                )
+        return cursor.rowcount > 0
+
+    def prune_expired_sessions(self, cutoff_ts: str) -> int:
+        """Delete sessions with expires_at < cutoff_ts, excluding pinned. Returns count deleted.
+
+        INSTEAD OF triggers on views do not update cursor.rowcount on the originating
+        DELETE, so we must count rows before deletion to get the accurate count.
+        """
+        before = self.conn.execute(
+            "SELECT COUNT(*) FROM sessions_prunable "
+            "WHERE julianday(expires_at) < julianday(?)", (cutoff_ts,)
+        ).fetchone()[0]
+        with self.conn:
+            self.conn.execute(
+                "DELETE FROM sessions_prunable "
+                "WHERE julianday(expires_at) < julianday(?)", (cutoff_ts,)
+            )
+        if before == 0:
+            logger.debug(
+                "prune_expired_sessions: 0 rows deleted before %s "
+                "(no expired unpinned sessions, or all matching sessions are pinned).",
+                cutoff_ts
+            )
+        return before
+
+    # -- Anti-pattern storage (v0.8.0) --
+
+    @contextmanager
+    def _write_context(self):
+        """Structural write-lock context manager. ALL mutations MUST use this.
+
+        Acquires self._write_lock and yields the live connection (reopening
+        it if the idle watchdog released it). Does not manage transactions --
+        callers issue BEGIN IMMEDIATE / COMMIT / ROLLBACK explicitly (required
+        for cross-process serialization via SQLite WAL). Read-only SELECT
+        calls do NOT use this context manager.
+        """
+        with self._write_lock:
+            yield self._ensure_conn_locked()
+
+    def _sweep_anti_pattern_orphans(self):
+        """Startup fallback: remove orphaned anti_pattern_sessions rows.
+
+        Called after _ensure_schema. Safe to run repeatedly; no-op when all
+        rows have matching sessions entries. Logs a warning with the count if
+        any orphans are removed (indicates prior FK enforcement gap).
+        """
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            self.conn.execute("""
+                DELETE FROM anti_pattern_sessions
+                WHERE session_id NOT IN (SELECT id FROM sessions)
+            """)
+            orphan_count = self.conn.execute("SELECT changes()").fetchone()[0]
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
+        if orphan_count > 0:
+            logger.warning(
+                "Startup sweep removed %d orphaned anti_pattern_sessions rows. "
+                "PRAGMA foreign_keys may not have been enforced on all prior connections. "
+                "Verify _open_conn() is used for every connection in database.py.",
+                orphan_count,
+            )
+
+    def _sweep_cooccurrence_orphans(self):
+        """Startup cleanup: remove orphaned session_cooccurrences rows (SH-100951).
+
+        Rows whose session_id references a deleted sessions row are legacy
+        residue from deletes performed before FK enforcement existed or
+        through connections that bypassed _open_conn(). The schema declares
+        ON DELETE CASCADE, but CASCADE only fires when PRAGMA foreign_keys=ON,
+        which SQLite defaults OFF per connection. All current delete paths
+        (delete_session, prune_expired_sessions) go through _open_conn()
+        connections with FK enforcement, so no new orphans accumulate -- this
+        sweep repairs existing damage only. Idempotent: a second run removes
+        0 rows and does not error. Logs the count removed so a customer with
+        a large repair sees what happened.
+        """
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            self.conn.execute("""
+                DELETE FROM session_cooccurrences
+                WHERE session_id NOT IN (SELECT id FROM sessions)
+            """)
+            orphan_count = self.conn.execute("SELECT changes()").fetchone()[0]
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
+        if orphan_count > 0:
+            logger.warning(
+                "Startup sweep removed %d orphaned session_cooccurrences rows. "
+                "These are legacy residue from deletes performed before FK "
+                "enforcement existed or through connections that bypassed "
+                "_open_conn(). No new orphans should accumulate through the "
+                "supported path.",
+                orphan_count,
+            )
+
+    def _check_rate_limit_db(self, conn) -> bool:
+        """DB-backed rate limit check. Called inside an open BEGIN IMMEDIATE transaction.
+
+        Returns True if the call is within the rate limit, False if exceeded.
+        Caller must already hold _write_lock (via _write_context).
+        """
+        import time as _time
+        now = _time.time()
+        now_iso = _time.strftime('%Y-%m-%dT%H:%M:%SZ', _time.gmtime(now))
+
+        row = conn.execute(
+            "SELECT window_start, call_count FROM anti_pattern_rate_state WHERE operation = 'tag'"
+        ).fetchone()
+
+        if row is None:
+            conn.execute(
+                "INSERT INTO anti_pattern_rate_state (operation, window_start, call_count) "
+                "VALUES ('tag', ?, 1)",
+                (now_iso,)
+            )
+            return True
+
+        try:
+            window_start_ts = calendar.timegm(
+                _time.strptime(row[0], '%Y-%m-%dT%H:%M:%SZ')
+            )
+        except ValueError:
+            logger.warning(
+                "anti_pattern_rate_state: malformed window_start %r, resetting rate window",
+                row[0],
+            )
+            window_start_ts = now - _TAG_RATE_WINDOW - 1
+
+        if now - window_start_ts > _TAG_RATE_WINDOW:
+            conn.execute(
+                "UPDATE anti_pattern_rate_state SET window_start = ?, call_count = 1 "
+                "WHERE operation = 'tag'",
+                (now_iso,)
+            )
+            return True
+
+        if row[1] >= _TAG_RATE_MAX:
+            return False
+
+        conn.execute(
+            "UPDATE anti_pattern_rate_state SET call_count = call_count + 1 "
+            "WHERE operation = 'tag'"
+        )
+        return True
+
+    def mark_anti_pattern(self, session_id: str,
+                           source: str = "unknown",
+                           reason: str = "") -> str:
+        """Mark a session as an anti-pattern. Idempotent.
+
+        Returns 'added' or 'already_present'. Writes an audit log row on every call.
+
+        Raises:
+            ValueError: on invalid session_id format.
+            LookupError: if session does not exist.
+            RuntimeError: if rate limit exceeded (use str(exc) for the error message).
+        """
+        if not isinstance(session_id, str) or not session_id.strip() or len(session_id) > 255:
+            raise ValueError("Invalid session_id: must be a non-empty string <= 255 chars")
+
+        source = (source or "unknown").strip()[:128]
+        reason = (reason or "").strip()[:500]
+
+        with self._write_context() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                if not self._check_rate_limit_db(conn):
+                    conn.execute("ROLLBACK")
+                    raise RuntimeError("rate_limit_exceeded: tag_as_anti_pattern")
+
+                row = conn.execute(
+                    "SELECT id FROM sessions WHERE id = ?", (session_id,)
+                ).fetchone()
+                if row is None:
+                    conn.execute("ROLLBACK")
+                    raise LookupError(f"Session not found: {session_id}")
+
+                conn.execute(
+                    "INSERT OR IGNORE INTO anti_pattern_sessions (session_id, source) VALUES (?, ?)",
+                    (session_id, source)
+                )
+                # Capture changes() immediately after INSERT OR IGNORE, before audit INSERT
+                changes = conn.execute("SELECT changes()").fetchone()[0]
+
+                conn.execute(
+                    "INSERT INTO anti_pattern_audit_log (session_id, action, source, reason) "
+                    "VALUES (?, 'tag', ?, ?)",
+                    (session_id, source, reason or None)
+                )
+                conn.execute("COMMIT")
+            except (LookupError, RuntimeError):
+                raise
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+        return "added" if changes else "already_present"
+
+    def remove_anti_pattern(self, session_id: str,
+                             source: str = "unknown",
+                             reason: str = "") -> str:
+        """Remove an anti-pattern tag from a session. Idempotent.
+
+        Returns 'removed' or 'not_present'. Writes an audit log row only on
+        successful removal (no-op path skips audit).
+
+        Raises:
+            ValueError: on invalid session_id format.
+        """
+        if not isinstance(session_id, str) or not session_id.strip() or len(session_id) > 255:
+            raise ValueError("Invalid session_id: must be a non-empty string <= 255 chars")
+
+        source = (source or "unknown").strip()[:128]
+        reason = (reason or "").strip()[:500]
+
+        with self._write_context() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    "DELETE FROM anti_pattern_sessions WHERE session_id = ?",
+                    (session_id,)
+                )
+                changes = conn.execute("SELECT changes()").fetchone()[0]
+
+                if changes > 0:
+                    conn.execute(
+                        "INSERT INTO anti_pattern_audit_log (session_id, action, source, reason) "
+                        "VALUES (?, 'untag', ?, ?)",
+                        (session_id, source, reason or None)
+                    )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+        return "removed" if changes else "not_present"
+
+    def get_anti_patterns(
+        self,
+        topic: Optional[str] = None,
+        limit: int = 10,
+        project: Optional[str] = None,
+    ) -> list:
+        """Retrieve sessions marked as anti-patterns.
+
+        Returns a list of dicts with a 'truncated' boolean. Mirrors the
+        MCP server's get_anti_patterns tool so the fallback script and CLI
+        can delegate here instead of re-implementing the query.
+
+        Args:
+            topic: Optional keyword to filter within anti-patterns. Omit
+                   for all anti-patterns ordered by recency. When provided,
+                   uses FTS5 search_sessions with a fan-out heuristic;
+                   result may be truncated if anti-patterns are sparse.
+            limit: Max results to return (1-100). Defaults to 10.
+            project: Restrict to a specific project slug. Case-sensitive.
+        """
+        if not isinstance(limit, int) or limit < 1 or limit > 100:
+            return [{"error": "limit must be an integer 1-100", "status": "error"}]
+
+        topic_clean = (topic or "").strip()[:500]
+        project_clean = (project or "").strip() or None
+        truncated = False
+
+        if not topic_clean:
+            params: list = []
+            sql = (
+                "SELECT s.* FROM sessions s "
+                "JOIN anti_pattern_sessions ap ON ap.session_id = s.id"
+            )
+            if project_clean:
+                sql += " WHERE s.project = ?"
+                params.append(project_clean)
+            sql += " ORDER BY s.start_date DESC LIMIT ?"
+            params.append(limit)
+            rows = self.conn.execute(sql, params).fetchall()
+            sessions_list = [self._row_to_session(r) for r in rows]
+        else:
+            fetch_limit = min(limit * 4, 400)
+            fts_results = self.search_sessions(
+                query=topic_clean,
+                project=project_clean,
+                limit=fetch_limit,
+            )
+            if not fts_results:
+                sessions_list = []
+            else:
+                candidate_ids = [r.session.id for r in fts_results]
+                placeholders = ",".join("?" * len(candidate_ids))
+                anti_ids = set(
+                    row[0] for row in self.conn.execute(
+                        "SELECT session_id FROM anti_pattern_sessions "
+                        "WHERE session_id IN ({})".format(placeholders),
+                        candidate_ids,
+                    ).fetchall()
+                )
+                sessions_list = [
+                    r.session for r in fts_results if r.session.id in anti_ids
+                ][:limit]
+            truncated = len(sessions_list) < limit
+
+        return [
+            {
+                "session_id": s.id or "",
+                "session_title": s.title or "",
+                "date": s.start_date or "",
+                "project": s.project or "",
+                "summary": (s.summary or "")[:2000],
+                "decisions": list(s.decisions) if isinstance(s.decisions, list) else [],
+                "open_questions": list(s.open_questions) if isinstance(s.open_questions, list) else [],
+                "truncated": truncated,
+            }
+            for s in sessions_list
+        ]
+
+    def _migrate_index_existing_cooccurrences(self):
+        """Populate session_cooccurrences for existing sessions on first run.
+
+        Idempotent: only runs when the table is empty, indicating first install
+        of this schema version. Subsequent startups skip the work.
+        Skips rows with NULL id (legacy migration artifact).
+        """
+        count = self.conn.execute(
+            "SELECT COUNT(*) FROM session_cooccurrences"
+        ).fetchone()[0]
+        if count > 0:
+            return  # already indexed
+
+        rows = self.conn.execute(
+            "SELECT id, summary, decisions, project, tags FROM sessions WHERE id IS NOT NULL"
+        ).fetchall()
+        for row in rows:
+            self._index_session_cooccurrences(
+                row[0], row[1], row[2], row[3], row[4]
+            )
+
+    @staticmethod
+    def _extract_keywords(text: str, top_n: int = 30) -> List[tuple]:
+        """Extract top-N keywords from text using simple term frequency.
+
+        Returns list of (term, frequency) tuples sorted descending by frequency.
+        Only includes tokens of 3+ characters not in the stopword list.
+        """
+        if not text:
+            return []
+        tokens = re.findall(r'[a-z]{3,}', text.lower())
+        counts: dict = {}
+        for token in tokens:
+            if token not in _STOPWORDS:
+                counts[token] = counts.get(token, 0) + 1
+        return sorted(counts.items(), key=lambda x: x[1], reverse=True)[:top_n]
+
+    def _index_session_cooccurrences(
+        self,
+        session_id: str,
+        summary: Optional[str],
+        decisions_json: Optional[str],
+        project: Optional[str],
+        tags_json: Optional[str],
+    ) -> None:
+        """Index keyword co-occurrences for a session.
+
+        Extracts keywords from summary, decisions, project, and tags.
+        Stores results in session_cooccurrences, replacing any prior index
+        for this session (idempotent for re-saves).
+        """
+        self.conn.execute(
+            "DELETE FROM session_cooccurrences WHERE session_id = ?",
+            (session_id,)
+        )
+
+        parts: List[str] = []
+        if summary:
+            parts.append(summary)
+        if decisions_json:
+            try:
+                decisions = json.loads(decisions_json)
+                if isinstance(decisions, list):
+                    parts.extend(str(d) for d in decisions)
+            except (json.JSONDecodeError, TypeError):
+                parts.append(str(decisions_json))
+        if project:
+            parts.append(project)
+
+        text = " ".join(parts)
+        keywords = self._extract_keywords(text)
+        for term, freq in keywords:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO session_cooccurrences (term, session_id, frequency) "
+                "VALUES (?, ?, ?)",
+                (term, session_id, freq)
+            )
+
+        # Boost tags as explicit terms (frequency 5 to weight them above noise)
+        if tags_json:
+            try:
+                tags = json.loads(tags_json)
+                if isinstance(tags, list):
+                    for tag in tags:
+                        if isinstance(tag, str):
+                            tag_term = re.sub(r'[^a-z]', '', tag.lower())
+                            if len(tag_term) >= 3 and tag_term not in _STOPWORDS:
+                                self.conn.execute(
+                                    "INSERT OR REPLACE INTO session_cooccurrences "
+                                    "(term, session_id, frequency) VALUES (?, ?, ?)",
+                                    (tag_term, session_id, 5)
+                                )
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+    def _auto_link_cooccurrences(self, session_id: str, min_shared_terms: int = 3) -> None:
+        """Create auto-links for sessions sharing >= min_shared_terms terms.
+
+        Links are stored in session_links with link_type='auto:cooccurrence'.
+        Uses INSERT OR IGNORE so manual links are never overwritten.
+        Caps at 20 new links per session to avoid link explosion.
+        Same-project scoping enforced (SH-104211): candidates must share the
+        source session's project, mirroring _auto_link_embeddings's policy.
+        """
+        candidates = self.conn.execute(
+            """SELECT sc2.session_id, COUNT(*) as shared_count
+               FROM session_cooccurrences sc1
+               JOIN session_cooccurrences sc2 ON sc1.term = sc2.term
+               JOIN sessions s1 ON sc1.session_id = s1.id
+               JOIN sessions s2 ON sc2.session_id = s2.id
+               WHERE sc1.session_id = ?
+                 AND sc2.session_id != ?
+                 AND s2.project IS s1.project
+               GROUP BY sc2.session_id
+               HAVING COUNT(*) >= ?
+               ORDER BY shared_count DESC
+               LIMIT 20""",
+            (session_id, session_id, min_shared_terms)
+        ).fetchall()
+
+        for row in candidates:
+            other_id = row[0]
+            self.conn.execute(
+                "INSERT OR IGNORE INTO session_links "
+                "(from_session_id, to_session_id, link_type) VALUES (?, ?, 'auto:cooccurrence')",
+                (session_id, other_id)
+            )
+
+    # -- Phase 2a: Embedding auto-link (Pro tier) --
+
+    def _auto_link_embeddings(self, session: "Session", cap: int = 10) -> None:
+        """Create bidirectional embedding-based links for a just-saved session.
+
+        Same-project scoping enforced. Bidirectional pairs are skipped if EITHER
+        direction already has any link type. Circuit breaker suppresses repeated
+        Lance failures without failing the save. Pro tier only.
+        """
+        from . import embedding_circuit as _circ
+        if not self.config.is_pro:
+            return
+        if os.environ.get("LORECONVO_EMBEDDING_LINKS", "1") == "0":
+            return
+        project = session.project or ""
+        if not _circ.check_circuit(project):
+            return
+        try:
+            lance = self._get_lance_index()
+            table = lance._open_table()
+            query_text = f"{session.title} {session.summary or ''}"
+            q_vec = lance._embed_one(query_text)
+            raw = table.search(
+                q_vec,
+                vector_column_name="vector",
+                query_type="vector",
+            ).limit(25).to_list()
+
+            # Filter: distance <= 0.707 (cosine >= 0.75), same project, not self
+            candidates = [
+                r["session_id"] for r in raw
+                if r.get("_distance", 999) <= 0.707
+                and r.get("session_id") != session.id
+                and r.get("project") == project
+            ]
+
+            inserted = 0
+            for other_id in candidates:
+                if inserted >= cap:
+                    break
+                existing = self.conn.execute(
+                    "SELECT 1 FROM session_links WHERE "
+                    "(from_session_id=? AND to_session_id=?) OR "
+                    "(from_session_id=? AND to_session_id=?)",
+                    (session.id, other_id, other_id, session.id)
+                ).fetchone()
+                if existing:
+                    continue
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO session_links "
+                    "(from_session_id, to_session_id, link_type) "
+                    "VALUES (?, ?, 'auto:embedding')",
+                    (session.id, other_id)
+                )
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO session_links "
+                    "(from_session_id, to_session_id, link_type) "
+                    "VALUES (?, ?, 'auto:embedding')",
+                    (other_id, session.id)
+                )
+                inserted += 1
+            self.conn.commit()
+            _circ.record_success(project)
+        except Exception as exc:
+            _circ.record_failure(project)
+            import logging as _log
+            _log.getLogger(__name__).error(
+                "auto_link_embeddings failed for session %s: %s", session.id, exc
+            )
+
+    # -- LanceDB hybrid search (Pro tier) --
+
+    def _get_lance_index(self):
+        """Return the LanceIndex instance, creating it lazily on first call."""
+        if self._lance_index is None:
+            from .hybrid_search import LanceIndex
+            lance_dir = Path(self.config.db_path).parent / 'sessions.lance'
+            self._lance_index = LanceIndex(lance_dir)
+        return self._lance_index
+
+    def _lance_write_safe(self, session: Session) -> None:
+        """Write session to Lance index if Pro tier. Errors are logged, never raised.
+
+        Skipped while a background rebuild is in progress -- the rebuild
+        will include this session when it completes.
+        """
+        if not self.config.is_pro:
+            return
+        with self._rebuild_lock:
+            if self._rebuild_state.get('in_progress'):
+                return
+        try:
+            self._get_lance_index().index_session(
+                session_id=session.id,
+                title=session.title,
+                summary=session.summary,
+                project=session.project,
+                surface=session.surface,
+                start_date=session.start_date,
+                tags=session.tags,
+                external_tool=session.external_tool_session,
+                source=session.source,
+            )
+        except Exception as exc:
+            import logging as _log
+            _log.getLogger(__name__).error("Lance write failed for %s: %s", session.id, exc)
+
+    def _fetch_sessions_for_semantic(
+        self,
+        session_ids: List[str],
+        persona: Optional[str],
+        tags: Optional[List[str]],
+        skills: Optional[List[str]],
+        limit: int,
+        include_external: bool,
+        include_expired: bool = False,
+        after: Optional[str] = None,
+        before: Optional[str] = None,
+    ) -> List[SearchResult]:
+        """Fetch sessions by ID (Lance results) and apply post-filters.
+
+        Preserves the relevance order returned by LanceIndex.search().
+        """
+        _exclusion_enabled = os.environ.get("LORECONVO_EXTERNAL_TOOL_EXCLUSION", "1") != "0"
+        placeholders = ",".join("?" * len(session_ids))
+        sql = f"SELECT * FROM sessions WHERE id IN ({placeholders})"
+        params = list(session_ids)
+        if _exclusion_enabled and not include_external:
+            sql += " AND (external_tool_session IS NULL OR external_tool_session = 0)"
+        if not include_expired:
+            sql += (
+                " AND (expires_at IS NULL "
+                "OR julianday(expires_at) > julianday('now'))"
+            )
+        if after is not None:
+            sql += " AND start_date >= ?"
+            params.append(after)
+        if before is not None:
+            sql += " AND start_date < ?"
+            params.append(before)
+        rows = self.conn.execute(sql, params).fetchall()
+
+        # Preserve relevance order from session_ids
+        id_to_row = {row['id']: row for row in rows}
+        results = []
+        for rank, sid in enumerate(session_ids):
+            row = id_to_row.get(sid)
+            if row is None:
+                continue
+            session = self._row_to_session(row)
+            results.append(SearchResult(session=session, match_score=1.0 / (rank + 1)))
+
+        if persona:
+            persona_ids = {r[0] for r in self.conn.execute(
+                "SELECT session_id FROM persona_sessions WHERE persona_name LIKE ?",
+                (persona + "%",)
+            ).fetchall()}
+            results = [r for r in results if r.session.id in persona_ids]
+
+        if skills:
+            skill_placeholders = ",".join("?" * len(skills))
+            skill_ids = {r[0] for r in self.conn.execute(
+                f"SELECT session_id FROM session_skills WHERE skill_name IN ({skill_placeholders})",
+                skills
+            ).fetchall()}
+            results = [r for r in results if r.session.id in skill_ids]
+
+        if tags:
+            results = [r for r in results if any(t in r.session.tags for t in tags)]
+
+        return results[:limit]
+
+    def rebuild_lance_index(self, background: bool = True) -> dict:
+        """Rebuild the Lance index from all SQLite sessions. Pro tier only.
+
+        By default starts the rebuild in a background thread and returns
+        immediately with a status handle.  Call ``rebuild_index_status()``
+        to poll progress.
+
+        When *background* is False (used by the background thread itself,
+        or for synchronous rebuilds in tests), runs the rebuild inline and
+        returns the full result dict.
+
+        Returns:
+          background=True (default):
+            {'status': 'started', 'message': '...'}
+            or {'status': 'busy', 'message': '...', 'progress_pct': N}
+          background=False:
+            The full result dict from LanceIndex.rebuild().
+        """
+        if not self.config.is_pro:
+            return {"error": "rebuild-index requires LoreConvo Pro"}
+
+        # Reject if already running
+        with self._rebuild_lock:
+            if self._rebuild_state.get('in_progress'):
+                progress_pct = self._rebuild_state.get('progress_pct', 0)
+                return {
+                    'status': 'busy',
+                    'message': (
+                        'A rebuild is already in progress. '
+                        'Call rebuild_index_status() for progress.'
+                    ),
+                    'progress_pct': progress_pct,
+                }
+            self._rebuild_state = {
+                'in_progress': True,
+                'phase': 'fetching',
+                'progress': 0,
+                'total': 0,
+                'progress_pct': 0,
+                'started_at': __import__('time').time(),
+                'done': False,
+                'error': None,
+                'result': None,
+                'exclusions': None,
+            }
+
+        rows = self.conn.execute(
+            "SELECT id, title, summary, project, surface, start_date, tags, "
+            "external_tool_session, source FROM sessions "
+            "WHERE id IS NOT NULL AND title IS NOT NULL"
+        ).fetchall()
+        sessions_list = [dict(r) for r in rows]
+
+        if background:
+            def _run():
+                import traceback
+                state = self._rebuild_state
+                state['total'] = len(sessions_list)
+                state['phase'] = 'starting'
+                try:
+                    from .hybrid_search import LanceIndex
+                    lance_dir = Path(self.config.db_path).parent / 'sessions.lance'
+                    index = LanceIndex(lance_dir)
+
+                    # Pass state dict so rebuild() can update progress
+                    result = index.rebuild(sessions_list, state=state)
+
+                    # Replace cached instance with the freshly built one
+                    self._lance_index = index
+
+                    with self._rebuild_lock:
+                        state['result'] = result
+                        state['done'] = True
+                        state['in_progress'] = False
+                        state['phase'] = 'done'
+                        state['progress_pct'] = 100
+                except Exception as exc:
+                    with self._rebuild_lock:
+                        state['error'] = str(exc)
+                        state['traceback'] = traceback.format_exc()
+                        state['done'] = True
+                        state['in_progress'] = False
+                        state['phase'] = 'error'
+                        import logging as _log
+                        _log.getLogger(__name__).error(
+                            "Background rebuild failed: %s", exc
+                        )
+
+            self._rebuild_thread = threading.Thread(
+                target=_run, daemon=True, name='loreconvo-rebuild'
+            )
+            self._rebuild_thread.start()
+            return {
+                'status': 'started',
+                'message': (
+                    'Rebuild started in background. '
+                    'Call rebuild_index_status() for progress. '
+                    'The server remains responsive.'
+                ),
+            }
+
+        # Synchronous path (for tests and direct CLI use)
+        from .hybrid_search import LanceIndex
+        lance_dir = Path(self.config.db_path).parent / 'sessions.lance'
+        index = LanceIndex(lance_dir)
+        result = index.rebuild(sessions_list, state=self._rebuild_state)
+        self._lance_index = index
+        with self._rebuild_lock:
+            self._rebuild_state['in_progress'] = False
+            self._rebuild_state['done'] = True
+            self._rebuild_state['result'] = result
+        return result
+
+    def rebuild_index_status(self) -> dict:
+        """Return the current status of a background rebuild, or idle state."""
+        with self._rebuild_lock:
+            state = dict(self._rebuild_state)
+        if not state:
+            return {
+                'status': 'idle',
+                'message': 'No rebuild has been started.',
+            }
+        if state.get('done'):
+            if state.get('error'):
+                return {
+                    'status': 'error',
+                    'message': f'Rebuild failed: {state.get("error")}',
+                    'phase': state.get('phase'),
+                    'result': state.get('result'),
+                }
+            result = state.get('result', {})
+            return {
+                'status': 'complete',
+                'message': 'Rebuild finished successfully.',
+                'indexed': result.get('indexed'),
+                'total_in_db': result.get('total_in_db'),
+                'exclusions': result.get('exclusions'),
+                'elapsed_s': result.get('elapsed_s'),
+            }
+        return {
+            'status': 'running',
+            'phase': state.get('phase', 'unknown'),
+            'progress': state.get('progress', 0),
+            'total': state.get('total', 0),
+            'progress_pct': state.get('progress_pct', 0),
+            'elapsed_s': __import__('time').time() - state.get('started_at', 0),
+        }
+
+    def get_related_sessions(
+        self,
+        session_id: str,
+        limit: int = 10,
+        min_shared_terms: int = 3,
+    ) -> dict:
+        """Return sessions related to session_id by co-occurrence and embedding links.
+
+        Returns a version:2 envelope:
+            {"version": 2, "sessions": [...]}
+
+        Each session dict includes "link_type": "auto:cooccurrence" or "auto:embedding".
+        Co-occurrence entries have shared_term_count >= 1. Embedding entries use
+        shared_term_count=0 as a sentinel (semantically related, no term overlap).
+        Co-occurrence wins when the same session appears in both result sets.
+        Embedding links are excluded for free-tier callers.
+        Total results never exceed `limit` (Max 50).
+        """
+        # Co-occurrence results (same-project scoping enforced, SH-104211)
+        cooc_rows = self.conn.execute(
+            """SELECT sc2.session_id,
+                      COUNT(*) as shared_count,
+                      s.title,
+                      s.project,
+                      s.start_date,
+                      s.summary
+               FROM session_cooccurrences sc1
+               JOIN session_cooccurrences sc2 ON sc1.term = sc2.term
+               JOIN sessions s1 ON sc1.session_id = s1.id
+               JOIN sessions s ON sc2.session_id = s.id
+               WHERE sc1.session_id = ?
+                 AND sc2.session_id != ?
+                 AND s.project IS s1.project
+                 AND (s.source IS NULL OR s.source NOT IN ('periodic', 'file_memory'))
+               GROUP BY sc2.session_id
+               HAVING COUNT(*) >= ?
+               ORDER BY shared_count DESC
+               LIMIT ?""",
+            (session_id, session_id, min_shared_terms, limit)
+        ).fetchall()
+
+        seen: dict = {}
+        for row in cooc_rows:
+            seen[row[0]] = {
+                "session_id": row[0],
+                "shared_term_count": row[1],
+                "link_type": "auto:cooccurrence",
+                "title": row[2],
+                "project": row[3],
+                "start_date": row[4],
+                "summary_preview": (row[5] or "")[:200],
+            }
+
+        # Embedding results from session_links (Pro only)
+        # Limit to remaining capacity: do not exceed total `limit`
+        if self.config.is_pro:
+            remaining_capacity = max(0, limit - len(seen))
+            emb_rows = self.conn.execute(
+                """SELECT sl.to_session_id, s.title, s.project, s.start_date, s.summary
+                   FROM session_links sl
+                   JOIN sessions s ON sl.to_session_id = s.id
+                   WHERE sl.from_session_id = ?
+                     AND sl.link_type = 'auto:embedding'
+                     AND (s.source IS NULL OR s.source NOT IN ('periodic', 'file_memory'))
+                   LIMIT ?""",
+                (session_id, remaining_capacity)
+            ).fetchall()
+            for row in emb_rows:
+                sid = row[0]
+                if sid not in seen:
+                    seen[sid] = {
+                        "session_id": sid,
+                        "shared_term_count": 0,
+                        "link_type": "auto:embedding",
+                        "title": row[1],
+                        "project": row[2],
+                        "start_date": row[3],
+                        "summary_preview": (row[4] or "")[:200],
+                    }
+
+        sessions = sorted(
+            seen.values(),
+            key=lambda r: r["shared_term_count"],
+            reverse=True,
+        )
+        return {"version": 2, "sessions": sessions}
+
+    def related_sessions_payload(
+        self,
+        session_id: str,
+        limit: int = 10,
+        min_shared_terms: int = 3,
+    ) -> dict:
+        """Assemble the get_related_sessions MCP response envelope (SH-101929).
+
+        Shared core version of the server.py tool body: the Pro gate, the
+        limit clamp, and the v2 envelope live in ONE place; the fallback
+        script and loreconvo-cli are second callers.
+        """
+        status = get_license_status()
+        if not status["is_pro"]:
+            return {
+                "error": (
+                    "get_related_sessions requires LoreConvo Pro. "
+                    f"Upgrade at {LORECONVO_UPGRADE_URL}, then set your "
+                    "LORECONVO_PRO license key."
+                )
+            }
+        limit = max(1, min(limit, 50))
+        result = self.get_related_sessions(session_id, limit, min_shared_terms)
+        sessions = result.get("sessions", [])
+        return {
+            "version": result.get("version", 2),
+            "session_id": session_id,
+            "related_count": len(sessions),
+            "related": sessions,
+        }
+
+    # -- Consolidation / digest / context payloads (SH-101929/101930) --
+
+    def consolidate_memories_payload(
+        self,
+        project: str,
+        surface: Optional[str] = None,
+        max_sessions: int = 50,
+        mode: str = "heuristic",
+        dedup: Optional[str] = None,
+    ) -> dict:
+        """Run memory consolidation for (project, surface) (SH-101930).
+
+        Shared core version of the consolidate_memories tool body: the
+        HeuristicConsolidator wiring, lore_dir resolution, and the
+        on-demand trigger live in ONE place; the fallback script and
+        loreconvo-cli are second callers of this method. `mode` is
+        accepted for MCP signature parity but forced to heuristic --
+        LLM mode is deferred to v0.6.1 exactly as the MCP tool behaves.
+        """
+        from .consolidation import HeuristicConsolidator
+
+        lore_dir = str(Path(self.config.db_path).parent)
+        consolidator = HeuristicConsolidator(lore_dir=lore_dir)
+        return consolidator.consolidate(
+            project=project,
+            surface=surface,
+            db=self,
+            max_sessions=max_sessions,
+            mode="heuristic",  # LLM mode deferred to v0.6.1
+            is_pro=self.config.is_pro,
+            trigger="on-demand",
+            dedup=dedup,
+        )
+
+    def memory_digest_payload(
+        self,
+        project: str,
+        surface: Optional[str],
+        disable: Optional[bool] = None,
+        max_tokens: int = 2000,
+    ) -> dict:
+        """Assemble the get_memory_digest MCP response envelope (SH-101930).
+
+        Shared core version of the server.py tool body: the optional
+        disable write, the no_digest envelope, and the max_tokens
+        truncation live in ONE place; the fallback script and
+        loreconvo-cli are second callers of this method.
+        """
+        if disable is not None:
+            self.update_digest_disabled(project, surface, disabled=disable)
+        digest = self.get_memory_digest(project, surface)
+        if digest is None:
+            return {
+                "status": "no_digest",
+                "message": "No memory digest found. Run consolidate_memories to generate one.",
+                "project": project,
+                "surface": surface,
+            }
+        digest_md = digest.get("digest_markdown", "")
+        if digest_md and max_tokens > 0:
+            estimated_tokens = len(digest_md) // 4
+            if estimated_tokens > max_tokens:
+                # Truncate at estimated token boundary (max_tokens * 4 chars)
+                truncate_at = max_tokens * 4
+                digest_md = digest_md[:truncate_at] + (
+                    "\n\n[TRUNCATED -- request smaller max_tokens or "
+                    "run consolidation with fewer sources]"
+                )
+        return {
+            "status": "ok",
+            "project": digest["project"],
+            "surface": digest["surface"],
+            "mode": digest.get("mode", "heuristic"),
+            "source_count": digest.get("source_count", 0),
+            "updated_at": digest.get("updated_at", ""),
+            "disabled": bool(digest.get("disabled", 0)),
+            "digest_markdown": digest_md,
+            "decisions": digest.get("decisions"),
+            "open_questions": digest.get("open_questions"),
+            "known_stack": digest.get("known_stack"),
+        }
+
+    def context_for_payload(
+        self,
+        topic: str,
+        max_results: int = 5,
+        include_external: bool = False,
+        semantic: bool = False,
+    ) -> List[dict]:
+        """Assemble the get_context_for MCP response (SH-101930).
+
+        Retrieves via get_context_for() and applies the SH-13436 trust
+        framing in one place -- the fallback script and loreconvo-cli get
+        the same untrusted-session-content boundary as the MCP tool.
+        """
+        results = self.get_context_for(
+            topic, max_results, include_external=include_external, semantic=semantic
+        )
+        out = []
+        for r in results:
+            s = r.session
+            # SH-13436: wrap content-bearing fields in the untrusted-session-content
+            # delimiter. session_title/date/match_score stay raw (not recalled
+            # content -- metadata only). Only non-empty strings are wrapped.
+            out.append({
+                "session_title": s.title,
+                "date": s.start_date,
+                "summary": trust_framing.wrap_untrusted(s.summary) if s.summary else s.summary,
+                "decisions": [trust_framing.wrap_untrusted(d) if d else d for d in s.decisions] if s.decisions else s.decisions,
+                "open_questions": [trust_framing.wrap_untrusted(q) if q else q for q in s.open_questions] if s.open_questions else s.open_questions,
+                "match_score": r.match_score,
+            })
+        return out
+
+    # -- Knowledge-graph traversal (SH-100263, graph_session_map) --
+
+    GRAPH_MAX_DEPTH = 3
+    GRAPH_MIN_NODES = 1
+    GRAPH_MAX_NODES = 200
+    GRAPH_DEFAULT_MAX_NODES = 60
+
+    def get_graph_neighborhood(
+        self,
+        seed_session_id: Optional[str] = None,
+        seed_project: Optional[str] = None,
+        depth: int = 1,
+        max_nodes: int = GRAPH_DEFAULT_MAX_NODES,
+    ) -> dict:
+        """Bounded, read-only BFS neighborhood for the graph_session_map MCP tool.
+
+        Every SELECT here runs on its own short-lived `mode=ro` SQLite
+        connection, opened after re-touching `self.conn` (which reopens the
+        write connection if the idle watchdog released it -- the WAL
+        precondition a read-only connection depends on). A write attempted
+        anywhere in this path raises `sqlite3.OperationalError` because the
+        connection is read-only at the driver level, not by convention.
+
+        Returns either `{"error": "GRAPH_DB_UNAVAILABLE", "message": str}` or
+        the full neighborhood dict: `seed_found`, `nodes`, `edges`,
+        `nodes_dropped_by_kind`, `edges_dropped_by_kind`,
+        `frontier_session_ids`, `edge_kinds_included`, `edge_kinds_omitted`.
+        Node dicts carry `raw_label` (unsanitized domain text) rather than a
+        sanitized `label` -- sanitization is `core.graph.sanitize_label`'s
+        job. This module references `core.graph` only through the function-
+        local static import in `build_graph_map_payload()` (added for the
+        SH-101927 three-surface parity work); the KG tool proposal's
+        no-dynamic-import constraint still holds -- the import is static.
+
+        See the architecture proposal for the full design and invariant list:
+        docs/agent-reports/architecture/proposals/loreconvo_kg_mermaid_graph_tool_20260804.md
+        """
+        depth = max(0, min(int(depth), self.GRAPH_MAX_DEPTH))
+        max_nodes = max(self.GRAPH_MIN_NODES, min(int(max_nodes), self.GRAPH_MAX_NODES))
+        max_edges = 5 * max_nodes
+
+        # Re-establish the WAL precondition: reopens _conn if the idle
+        # watchdog released it. This does not itself perform any traversal
+        # read -- it is the precondition the mode=ro open below depends on.
+        self.conn
+        ro_conn, error = self._open_graph_ro_connection()
+        if ro_conn is None:
+            return {"error": "GRAPH_DB_UNAVAILABLE", "message": error}
+        try:
+            return self._graph_traverse(
+                ro_conn, seed_session_id, seed_project, depth, max_nodes, max_edges
+            )
+        finally:
+            ro_conn.close()
+
+    def _open_graph_ro_connection(self):
+        """Open a fresh mode=ro connection, retrying once if the idle watchdog raced us.
+
+        Returns (connection, None) on success or (None, error_message) if the
+        open still fails after one retry.
+        """
+        try:
+            conn = sqlite3.connect(f"file:{self.config.db_path}?mode=ro", uri=True)
+        except sqlite3.OperationalError:
+            self.conn  # watchdog raced us between the reopen above and here; retry once
+            try:
+                conn = sqlite3.connect(f"file:{self.config.db_path}?mode=ro", uri=True)
+            except sqlite3.OperationalError as exc2:
+                return None, str(exc2)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=10000")
+        return conn, None
+
+    def _graph_traverse(
+        self, conn, seed_session_id, seed_project, depth, max_nodes, max_edges
+    ) -> dict:
+        if bool(seed_session_id) == bool(seed_project):
+            raise ValueError("exactly one of seed_session_id or seed_project is required")
+
+        seed_kind = "session" if seed_session_id else "project"
+        seed_value = seed_session_id if seed_session_id else seed_project
+
+        nodes: List[dict] = []
+        node_id_by_key: dict = {}
+        nodes_dropped_by_kind: dict = {}
+        budget_remaining = max_nodes
+
+        def admit(kind, ref, raw_label, **extra):
+            nonlocal budget_remaining
+            key = (kind, ref)
+            existing = node_id_by_key.get(key)
+            if existing is not None:
+                return existing
+            if budget_remaining <= 0:
+                nodes_dropped_by_kind[kind] = nodes_dropped_by_kind.get(kind, 0) + 1
+                return None
+            node_id = f"n{len(nodes)}"
+            node = {"id": node_id, "kind": kind, "ref": ref, "raw_label": raw_label}
+            node.update(extra)
+            nodes.append(node)
+            node_id_by_key[key] = node_id
+            budget_remaining -= 1
+            return node_id
+
+        # -- Seed resolution --
+        if seed_kind == "session":
+            row = conn.execute("SELECT 1 FROM sessions WHERE id = ?", (seed_value,)).fetchone()
+            seed_found = row is not None
+            hop0_ids = [seed_value] if seed_found else []
+        else:
+            row = conn.execute(
+                "SELECT 1 FROM sessions WHERE project = ? LIMIT 1", (seed_value,)
+            ).fetchone()
+            seed_found = row is not None
+            if seed_found:
+                rows = conn.execute(
+                    "SELECT id FROM sessions WHERE project = ? "
+                    "ORDER BY COALESCE(start_date, '') DESC, id ASC",
+                    (seed_value,)
+                ).fetchall()
+                hop0_ids = [r["id"] for r in rows]
+            else:
+                hop0_ids = []
+
+        if not seed_found:
+            return {
+                "seed_found": False,
+                "nodes": [],
+                "edges": [],
+                "nodes_dropped_by_kind": {},
+                "edges_dropped_by_kind": {},
+                "frontier_session_ids": [],
+                "edge_kinds_included": [],
+                "edge_kinds_omitted": [],
+            }
+
+        session_info: dict = {}  # session_id -> {"title", "project", "tags_raw"}
+
+        def fetch_session_rows(ids):
+            ids = [i for i in ids if i not in session_info]
+            if not ids:
+                return
+            placeholders = ",".join("?" for _ in ids)
+            rows = conn.execute(
+                f"SELECT id, title, project, tags FROM sessions WHERE id IN ({placeholders})",
+                tuple(ids)
+            ).fetchall()
+            for r in rows:
+                session_info[r["id"]] = {
+                    "title": r["title"], "project": r["project"], "tags_raw": r["tags"]
+                }
+
+        def session_meta(sid):
+            return session_info.get(sid, {"title": "", "project": None, "tags_raw": None})
+
+        # -- Phase 1: seed node(s) --
+        if seed_kind == "project":
+            admit("project", seed_value, seed_value)
+
+        fetch_session_rows(hop0_ids)
+        hop_of: dict = {}
+        visited = set(hop0_ids)
+        admitted_session_order: List[str] = []  # first-admission order, for phase 4
+        session_order_seen: set = set()
+
+        def record_session_order(sid, node_id):
+            if node_id is not None and sid not in session_order_seen:
+                session_order_seen.add(sid)
+                admitted_session_order.append(sid)
+
+        frontier_admitted: List[str] = []
+        for sid in hop0_ids:
+            info = session_meta(sid)
+            node_id = admit("session", sid, info["title"], hop=0, is_frontier=False)
+            hop_of[sid] = 0
+            record_session_order(sid, node_id)
+            if node_id is not None:
+                frontier_admitted.append(sid)
+
+        # -- Phase 2: BFS expansion over `link` edges, one batched query per hop --
+        link_edge_candidates: List[tuple] = []
+        seen_link_edges: set = set()
+        current_hop = 0
+        while frontier_admitted:
+            frontier_set = set(frontier_admitted)
+            placeholders = ",".join("?" for _ in frontier_admitted)
+            rows = conn.execute(
+                f"""SELECT from_session_id, to_session_id, link_type FROM session_links
+                    WHERE from_session_id IN ({placeholders})
+                       OR to_session_id IN ({placeholders})""",
+                tuple(frontier_admitted) * 2
+            ).fetchall()
+
+            candidates: List[str] = []
+            seen_candidates: set = set()
+            for r in rows:
+                f, t, lt = r["from_session_id"], r["to_session_id"], r["link_type"]
+                key = (f, t)
+                if key not in seen_link_edges:
+                    seen_link_edges.add(key)
+                    link_edge_candidates.append((f, t, lt))
+                for end in (f, t):
+                    if end not in frontier_set and end not in visited and end not in seen_candidates:
+                        candidates.append(end)
+                        seen_candidates.add(end)
+
+            if current_hop >= depth or not candidates:
+                break
+
+            placeholders2 = ",".join("?" for _ in candidates)
+            crows = conn.execute(
+                f"SELECT id FROM sessions WHERE id IN ({placeholders2}) "
+                "ORDER BY COALESCE(start_date, '') DESC, id ASC",
+                tuple(candidates)
+            ).fetchall()
+            ordered_candidates = [r["id"] for r in crows]
+
+            fetch_session_rows(ordered_candidates)
+            next_frontier: List[str] = []
+            for sid in ordered_candidates:
+                visited.add(sid)
+                info = session_meta(sid)
+                node_id = admit("session", sid, info["title"], hop=current_hop + 1, is_frontier=False)
+                hop_of[sid] = current_hop + 1
+                record_session_order(sid, node_id)
+                if node_id is not None:
+                    next_frontier.append(sid)
+
+            frontier_admitted = next_frontier
+            current_hop += 1
+
+        for node in nodes:
+            if node["kind"] == "session" and node.get("hop") is not None:
+                node["is_frontier"] = (node["hop"] == depth)
+
+        frontier_session_ids = [
+            sid for sid, h in hop_of.items()
+            if h == depth and ("session", sid) in node_id_by_key
+        ]
+
+        # -- Phase 3: seed-only Pro-derived nodes (derived session nodes, then doc leaves) --
+        # Applies only to a session seed: `get_related_sessions` and the LoreDocs
+        # cross-link query both take a single session id, and "at most one call
+        # regardless of max_nodes" would not hold for a project seed with many
+        # hop-0 sessions. A project seed therefore carries no derived/doc kinds.
+        edge_kinds_included = ["link", "project", "skill", "persona", "tag"]
+        edge_kinds_omitted: List[dict] = []
+        derived_edge_candidates: List[tuple] = []
+        doc_edge_candidates: List[tuple] = []
+
+        if seed_kind == "session":
+            if not self.config.is_pro:
+                edge_kinds_omitted.append({"kind": "derived", "reason": "pro_required"})
+                edge_kinds_omitted.append({"kind": "doc", "reason": "pro_required"})
+            else:
+                edge_kinds_included.append("derived")
+                try:
+                    related = self.get_related_sessions(seed_value, limit=50, min_shared_terms=1)
+                except Exception:
+                    related = {"sessions": []}
+                for r in related.get("sessions", []):
+                    rel_sid = r.get("session_id")
+                    if not rel_sid:
+                        continue
+                    admit("session", rel_sid, r.get("title", ""), hop=None, is_frontier=False)
+                    record_session_order(rel_sid, node_id_by_key.get(("session", rel_sid)))
+                    derived_edge_candidates.append((seed_value, rel_sid))
+
+                doc_links = self._graph_cross_product_links(seed_value)
+                if doc_links is None:
+                    edge_kinds_omitted.append({"kind": "doc", "reason": "cross_product_unavailable"})
+                else:
+                    edge_kinds_included.append("doc")
+                    for link in doc_links:
+                        target_id = link.get("target_id")
+                        if not target_id:
+                            continue
+                        admit("doc", target_id, target_id)
+                        doc_edge_candidates.append((seed_value, target_id))
+
+        # -- Phase 4: attribute leaves, grouped by owning session in admission order --
+        attr_edge_candidates: List[tuple] = []  # (kind, from_node_id, to_node_id, extra)
+
+        if admitted_session_order:
+            placeholders = ",".join("?" for _ in admitted_session_order)
+            skill_rows = conn.execute(
+                f"""SELECT session_id, skill_name, invocation_count FROM session_skills
+                    WHERE session_id IN ({placeholders}) ORDER BY session_id, skill_name ASC""",
+                tuple(admitted_session_order)
+            ).fetchall()
+            persona_rows = conn.execute(
+                f"""SELECT session_id, persona_name FROM persona_sessions
+                    WHERE session_id IN ({placeholders}) ORDER BY session_id, persona_name ASC""",
+                tuple(admitted_session_order)
+            ).fetchall()
+        else:
+            skill_rows, persona_rows = [], []
+
+        skills_by_session: dict = {}
+        for r in skill_rows:
+            skills_by_session.setdefault(r["session_id"], []).append(
+                (r["skill_name"], r["invocation_count"])
+            )
+        personas_by_session: dict = {}
+        for r in persona_rows:
+            personas_by_session.setdefault(r["session_id"], []).append(r["persona_name"])
+
+        for sid in admitted_session_order:
+            session_node_id = node_id_by_key[("session", sid)]
+            info = session_meta(sid)
+
+            proj_val = info.get("project")
+            if proj_val:
+                attr_node_id = admit("project", proj_val, proj_val)
+                attr_edge_candidates.append(("project", session_node_id, attr_node_id, {}))
+
+            for skill_name, invocation_count in skills_by_session.get(sid, []):
+                attr_node_id = admit("skill", skill_name, skill_name)
+                attr_edge_candidates.append(
+                    ("skill", session_node_id, attr_node_id, {"weight": invocation_count})
+                )
+
+            for persona_name in personas_by_session.get(sid, []):
+                attr_node_id = admit("persona", persona_name, persona_name)
+                attr_edge_candidates.append(("persona", session_node_id, attr_node_id, {}))
+
+            tags = self._parse_json_field(info.get("tags_raw"), default="[]")
+            clean_tags = sorted({str(t) for t in tags if isinstance(t, str) and t})
+            for tag in clean_tags:
+                attr_node_id = admit("tag", tag, tag)
+                attr_edge_candidates.append(("tag", session_node_id, attr_node_id, {}))
+
+        # -- Edge budget: link first, then derived, then doc, then attribute kinds --
+        edges: List[dict] = []
+        edges_dropped_by_kind: dict = {}
+        edge_budget_remaining = max_edges
+
+        def try_add_edge(kind, from_id, to_id, **extra):
+            nonlocal edge_budget_remaining
+            if from_id is None or to_id is None:
+                return  # an endpoint was dropped for node budget -- not an edge-budget event
+            if edge_budget_remaining <= 0:
+                edges_dropped_by_kind[kind] = edges_dropped_by_kind.get(kind, 0) + 1
+                return
+            edge = {"from": from_id, "to": to_id, "kind": kind}
+            edge.update(extra)
+            edges.append(edge)
+            edge_budget_remaining -= 1
+
+        for f, t, lt in link_edge_candidates:
+            try_add_edge(
+                "link",
+                node_id_by_key.get(("session", f)),
+                node_id_by_key.get(("session", t)),
+                link_type=lt,
+            )
+
+        for f_sid, rel_sid in derived_edge_candidates:
+            try_add_edge(
+                "derived",
+                node_id_by_key.get(("session", f_sid)),
+                node_id_by_key.get(("session", rel_sid)),
+            )
+
+        for f_sid, doc_id in doc_edge_candidates:
+            try_add_edge(
+                "doc",
+                node_id_by_key.get(("session", f_sid)),
+                node_id_by_key.get(("doc", doc_id)),
+            )
+
+        for kind, from_id, to_id, extra in attr_edge_candidates:
+            try_add_edge(kind, from_id, to_id, **extra)
+
+        return {
+            "seed_found": True,
+            "nodes": nodes,
+            "edges": edges,
+            "nodes_dropped_by_kind": nodes_dropped_by_kind,
+            "edges_dropped_by_kind": edges_dropped_by_kind,
+            "frontier_session_ids": frontier_session_ids,
+            "edge_kinds_included": edge_kinds_included,
+            "edge_kinds_omitted": edge_kinds_omitted,
+        }
+
+    def _graph_cross_product_links(self, session_id: str):
+        """Return LoreDocs cross-product links for a graph seed, or None if unavailable.
+
+        Mirrors the degradation `get_docs_for_session` already implements at
+        server.py -- any failure (LoreDocs absent, unreachable, schema too
+        old) is reported as unavailable rather than raised. Distinguishable
+        reasons go to the log (SH-100670 Part B).
+        """
+        log = logging.getLogger(__name__)
+        try:
+            ld_db = discover_loredocs_db()
+        except LoreDocsAccessError as exc:
+            log.warning(
+                "graph cross-product links: LoreDocs installed but unreachable (%s)",
+                exc,
+            )
+            return None
+        if ld_db is None:
+            log.debug("graph cross-product links: LoreDocs not installed")
+            return None
+        try:
+            result = get_cross_product_links(
+                ld_db,
+                source_product="loreconvo",
+                source_id=session_id,
+                current_embedding_model=CROSS_LINK_EMBEDDING_MODEL,
+                limit=50,
+                is_pro=True,
+            )
+        except LoreDocsSchemaError as exc:
+            log.warning(
+                "graph cross-product links: LoreDocs schema too old (%s)",
+                exc,
+            )
+            return None
+        except Exception as exc:
+            log.warning(
+                "graph cross-product links: unavailable (%s)",
+                type(exc).__name__,
+            )
+            return None
+        return result.get("links", [])
+
+    def close(self):
+        with self._write_lock:
+            self._closed = True
+            if self._conn is not None:
+                self._conn.close()
+                self._conn = None
+            # SH-104068: drop the LanceIndex (and the ~120 MB embedding model
+            # it holds). A closed DB that is still referenced -- e.g. by a
+            # pytest class instance that outlives the test -- otherwise pins
+            # the model; across a test suite that reached 15-31 GB.
+            self._lance_index = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+    @staticmethod
+    def compute_content_hash(title: str, summary: str, created_at: str) -> str:
+        """Compute a stable SHA-256 hash for deduplication on merge."""
+        raw = f"{title}|{summary}|{created_at}"
+        return "sha256:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _get_origin_machine() -> str:
+        return os.environ.get("LORECONVO_USER_ID", "") or socket.gethostname()
+
+    # -- Session CRUD --
+
+    def save_session(self, session: Session) -> str:
+        if not session.id:
+            raise ValueError(
+                "Session id must not be None or empty. "
+                "Use the Session dataclass (which auto-generates a UUID) "
+                "instead of raw SQL inserts."
+            )
+        truncate_session_fields(session)
+        # SH-103918: normalize project name on write so the store never
+        # accumulates spelling variants of the same project.
+        session.project = normalize_project_name(session.project)
+        existing = self.conn.execute(
+            "SELECT summary, project, surface, source, external_tool_session, "
+            "start_date FROM sessions WHERE id = ?",
+            (session.id,),
+        ).fetchone()
+        # Enforce BSL 1.1 free-tier session limit.
+        # Pro mode (valid LORECONVO_PRO license key) bypasses this check.
+        if not existing and not self.config.is_pro:
+            current_count = self.session_count()
+            if current_count >= self.config.max_free_sessions:
+                raise SessionLimitReachedError(
+                    f"Free tier limit reached: {current_count} of "
+                    f"{self.config.max_free_sessions} sessions stored. "
+                    f"Upgrade at {LORECONVO_UPGRADE_URL} to unlock unlimited "
+                    "sessions, then set your LORECONVO_PRO license key."
+                )
+        content_hash = (
+            session.content_hash
+            or self.compute_content_hash(session.title, session.summary, session.created_at)
+        )
+        origin_machine = session.origin_machine or self._get_origin_machine()
+        self.conn.execute(
+            """INSERT INTO sessions
+               (id, title, surface, project, start_date, end_date, summary,
+                decisions, artifacts, open_questions, tags, created_at, source,
+                shared_by, origin_machine, content_hash, external_tool_session,
+                reasoning_notes, previous_summary)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET
+               title = excluded.title,
+               surface = excluded.surface,
+               project = excluded.project,
+               start_date = excluded.start_date,
+               end_date = excluded.end_date,
+               summary = excluded.summary,
+               decisions = excluded.decisions,
+               artifacts = excluded.artifacts,
+               open_questions = excluded.open_questions,
+               tags = excluded.tags,
+               source = excluded.source,
+               shared_by = excluded.shared_by,
+               origin_machine = excluded.origin_machine,
+               content_hash = excluded.content_hash,
+               external_tool_session = excluded.external_tool_session,
+               reasoning_notes = excluded.reasoning_notes,
+               previous_summary = CASE
+                   WHEN sessions.summary IS NOT excluded.summary
+                   THEN sessions.summary
+                   ELSE sessions.previous_summary
+               END""",
+            (
+                session.id, session.title, session.surface, session.project,
+                session.start_date, session.end_date, session.summary,
+                json.dumps(session.decisions), json.dumps(session.artifacts),
+                json.dumps(session.open_questions), json.dumps(session.tags),
+                session.created_at, session.source,
+                session.shared_by, origin_machine, content_hash,
+                1 if session.external_tool_session else 0,
+                session.reasoning_notes if session.reasoning_notes else None,
+                None,
+            )
+        )
+        if existing and any((
+            existing["summary"] != session.summary,
+            existing["project"] != session.project,
+            existing["surface"] != session.surface,
+            existing["source"] != session.source,
+            bool(existing["external_tool_session"])
+            != session.external_tool_session,
+            existing["start_date"] != session.start_date,
+        )):
+            self._invalidate_memory_digests_for_session_scope(
+                existing["project"], existing["surface"]
+            )
+            self._invalidate_memory_digests_for_session_scope(
+                session.project, session.surface
+            )
+        # Preserve insertion order via the position column (SH-103920).
+        # INSERT OR REPLACE updates position in place, so a same-set re-save
+        # reorders correctly without needing a delete-first. (A shrink that
+        # removes a skill is out of scope here -- that is a pre-existing,
+        # separate behaviour and a delete-first would also break the
+        # cascade-safety invariant in test_database_cascade_safety.py.)
+        for position, skill_name in enumerate(session.skills_used):
+            self.conn.execute(
+                """INSERT OR REPLACE INTO session_skills
+                   (session_id, skill_name, invocation_count, position)
+                   VALUES (?, ?, 1, ?)""",
+                (session.id, skill_name, position)
+            )
+        self.conn.commit()
+
+        # Index co-occurrences and auto-link related sessions (additive, non-blocking)
+        try:
+            self._index_session_cooccurrences(
+                session.id,
+                session.summary,
+                json.dumps(session.decisions),
+                session.project,
+                json.dumps(session.tags),
+            )
+            self._auto_link_cooccurrences(session.id)
+            self.conn.commit()
+        except Exception:
+            pass  # co-occurrence index is best-effort; never fail a save
+
+        # Dual-write to Lance index (Pro only, errors never propagate)
+        self._lance_write_safe(session)
+
+        # Phase 2a: embedding-based auto-link (Pro only, errors never propagate)
+        self._auto_link_embeddings(session)
+
+        # Phase 2b: save-triggered cross-product linking (Pro only, best-effort)
+        try:
+            self.cross_link_session(session.id, session.summary or "")
+        except Exception:
+            pass
+
+        return session.id
+
+    def cross_link_session(self, session_id: str, session_text: str) -> int:
+        """Trigger save-time cross-product linking for a LoreConvo session.
+
+        Queries the LoreDocs docs.lance index for semantically similar documents,
+        writes up to 5 links into LoreDocs cross_product_links. Pro-only.
+        Updates sessions.last_cross_linked_at for debounce.
+
+        Returns count of links written (0 if LoreDocs unavailable, not Pro, etc).
+        """
+        import logging as _logging
+        log = _logging.getLogger(__name__)
+
+        if not self.config.is_pro:
+            return 0
+
+        # Check debounce
+        now_str = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+        row = self.conn.execute(
+            "SELECT last_cross_linked_at FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        if row and row["last_cross_linked_at"]:
+            try:
+                last = datetime.fromisoformat(row["last_cross_linked_at"].replace("Z", "+00:00"))
+                if (datetime.now(timezone.utc) - last).total_seconds() < CROSS_LINK_DEBOUNCE_SECS:
+                    return 0
+            except Exception:
+                pass
+
+        # Check session opt-out
+        opt_row = self.conn.execute(
+            "SELECT cross_link_opt_out FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        if opt_row and opt_row["cross_link_opt_out"]:
+            return 0
+
+        # Discover LoreDocs and its Lance index
+        # (SH-100670: direct sqlite3 access -- the loredocs package is not
+        # importable from LoreConvo's isolated uvx environment.)
+        try:
+            ld_db = discover_loredocs_db()
+        except LoreDocsAccessError as exc:
+            log.warning(
+                "cross_link_session: LoreDocs installed but unreachable (%s)",
+                exc,
+            )
+            return 0
+        if ld_db is None:
+            log.debug("cross_link_session: LoreDocs not installed")
+            return 0
+
+        lance_path = get_lancedb_path(ld_db)
+        if lance_path is None:
+            log.debug(
+                "cross_link_session: LoreDocs installed but Pro index not "
+                "built (docs.lance missing) -- skipping auto cross-link"
+            )
+            return 0
+
+        query_text = session_text[:2000] if session_text else ""
+        if not query_text:
+            return 0
+
+        try:
+            import lancedb as _lancedb
+            from .hybrid_search import get_shared_embedding_model
+
+            # Same BGE-small model as before, ONNX-quantized. Vectors differ
+            # slightly from the old torch fp32 output, which is why the 0.8.7
+            # CHANGELOG recommends a one-time rebuild_index.
+            model = get_shared_embedding_model(CROSS_LINK_EMBEDDING_MODEL)
+            q_vec = next(iter(model.embed([query_text]))).tolist()
+
+            ld_lance_db = _lancedb.connect(str(lance_path))
+            table = ld_lance_db.open_table("docs")
+            raw = table.search(
+                q_vec, vector_column_name="vector", query_type="vector"
+            ).limit(50).to_list()
+
+            # Deduplicate to best distance per doc_id
+            best: dict = {}
+            for r in raw:
+                did = r.get("doc_id")
+                dist = r.get("_distance", 999.0)
+                if not did:
+                    continue
+                if dist > CROSS_LINK_L2_THRESHOLD:
+                    continue
+                if did not in best or dist < best[did]:
+                    best[did] = dist
+
+            # Write cross-product links directly into the LoreDocs DB
+            # (SH-100670 bridge; mirrors VaultStorage._write_cross_product_link
+            # and the LoreDocs->LoreConvo write precedent).
+            written = 0
+            with _connect_readwrite(ld_db) as conn:
+                _verify_schema(conn)
+                for did, dist in sorted(best.items(), key=lambda x: x[1])[:CROSS_LINK_CAP]:
+                    if written >= CROSS_LINK_CAP:
+                        break
+                    # Check vault opt-out
+                    vault_row = conn.execute(
+                        """SELECT v.cross_link_opt_out FROM documents d
+                           JOIN vaults v ON d.vault_id = v.id
+                           WHERE d.id = ? AND d.deleted = 0""",
+                        (did,)
+                    ).fetchone()
+                    if not vault_row or vault_row[0]:
+                        continue
+                    cosine = max(0.0, 1.0 - dist)
+                    write_cross_product_link(
+                        conn,
+                        source_product="loreconvo",
+                        source_id=session_id,
+                        target_product="loredocs",
+                        target_id=did,
+                        similarity_score=round(cosine, 4),
+                        embedding_model=CROSS_LINK_EMBEDDING_MODEL,
+                        embedding_dim=CROSS_LINK_EMBEDDING_DIM,
+                        link_type="auto",
+                        tier_required="pro",
+                    )
+                    written += 1
+
+            self.conn.execute(
+                "UPDATE sessions SET last_cross_linked_at = ? WHERE id = ?",
+                (now_str, session_id),
+            )
+            self.conn.commit()
+            log.debug("cross_link_session: wrote %d links for session %s", written, session_id)
+            return written
+        except LoreDocsSchemaError as exc:
+            log.warning("cross_link_session: LoreDocs schema too old (%s)", exc)
+            return 0
+        except Exception as exc:
+            log.warning("cross_link_session: unavailable (%s)", type(exc).__name__)
+            return 0
+
+    def get_session(self, session_id: str) -> Optional[Session]:
+        """Return one session, or None.
+
+        ``skills_used`` is returned in insertion order (the order skills were
+        saved), not alphabetical -- preserved via the ``position`` column
+        (SH-103920).
+        """
+        row = self.conn.execute(
+            "SELECT * FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        if not row:
+            return None
+        session = self._row_to_session(row)
+        skills = self.conn.execute(
+            "SELECT skill_name FROM session_skills WHERE session_id = ? "
+            "ORDER BY position, skill_name",
+            (session_id,)
+        ).fetchall()
+        session.skills_used = [s["skill_name"] for s in skills]
+        return session
+
+    def get_recent_sessions(
+        self, limit: int = 10, days_back: int = 30,
+        project: Optional[str] = None, skill: Optional[str] = None,
+        include_external: bool = False,
+        include_expired: bool = False,
+    ) -> List[Session]:
+        _exclusion_enabled = os.environ.get("LORECONVO_EXTERNAL_TOOL_EXCLUSION", "1") != "0"
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days_back)).isoformat().replace('+00:00', 'Z')
+        query = "SELECT * FROM sessions WHERE start_date >= ? AND (source IS NULL OR source NOT IN ('periodic', 'file_memory'))"
+        if _exclusion_enabled and not include_external:
+            query += " AND (external_tool_session IS NULL OR external_tool_session = 0)"
+        if not include_expired:
+            query += (
+                " AND (expires_at IS NULL "
+                "OR julianday(expires_at) > julianday('now'))"
+            )
+        params = [cutoff]
+
+        if project:
+            normalized = normalize_project_name(project)
+            if normalized:
+                query += " AND project = ?"
+                params.append(normalized)
+
+        if skill:
+            query += " AND id IN (SELECT session_id FROM session_skills WHERE skill_name = ?)"
+            params.append(skill)
+
+        query += " ORDER BY start_date DESC LIMIT ?"
+        params.append(limit)
+
+        rows = self.conn.execute(query, params).fetchall()
+        return [self._row_to_session(r) for r in rows]
+
+    # FTS5 query preprocessing lives in storage_core -- the single definition
+    # shared with the fallback script. These remain as staticmethods so
+    # existing callers and tests keep working.
+    _expand_compound_token = staticmethod(expand_compound_token)
+    _sanitize_fts_query = staticmethod(sanitize_fts_query)
+
+    def search_sessions(
+        self, query: str, persona: Optional[str] = None,
+        tags: Optional[List[str]] = None, skills: Optional[List[str]] = None,
+        project: Optional[str] = None, limit: int = 10,
+        include_external: bool = False,
+        semantic: bool = False,
+        include_expired: bool = False,
+        after: Optional[str] = None,
+        before: Optional[str] = None,
+    ) -> List[SearchResult]:
+        # Semantic path: Pro tier + Lance index available
+        if semantic and self.config.is_pro:
+            lance = self._get_lance_index()
+            if lance.is_available():
+                session_ids = lance.search(
+                    query,
+                    project=project,
+                    limit=limit * 3,
+                    half_life_days=SEARCH_HALF_LIFE_DAYS,
+                )
+                if session_ids:
+                    return self._fetch_sessions_for_semantic(
+                        session_ids, persona, tags, skills, limit, include_external,
+                        include_expired=include_expired,
+                        after=after, before=before,
+                    )
+            # Fall through to FTS5 if Lance unavailable or no results
+
+        _exclusion_enabled = os.environ.get("LORECONVO_EXTERNAL_TOOL_EXCLUSION", "1") != "0"
+        fts_query = self._sanitize_fts_query(query)
+        sql = """
+            SELECT s.*, sessions_fts.rank
+            FROM sessions s
+            JOIN sessions_fts ON s.rowid = sessions_fts.rowid
+            WHERE sessions_fts MATCH ?
+        """
+        if _exclusion_enabled and not include_external:
+            sql += " AND (s.external_tool_session IS NULL OR s.external_tool_session = 0)"
+        if not include_expired:
+            sql += (
+                " AND (s.expires_at IS NULL "
+                "OR julianday(s.expires_at) > julianday('now'))"
+            )
+        params = [fts_query]
+
+        if after is not None:
+            sql += " AND s.start_date >= ?"
+            params.append(after)
+        if before is not None:
+            sql += " AND s.start_date < ?"
+            params.append(before)
+
+        if persona:
+            sql += " AND s.id IN (SELECT session_id FROM persona_sessions WHERE persona_name LIKE ?)"
+            params.append(persona + "%")
+
+        if project:
+            normalized = normalize_project_name(project)
+            if normalized:
+                sql += " AND s.project = ?"
+                params.append(normalized)
+
+        if skills:
+            placeholders = ",".join("?" * len(skills))
+            sql += f" AND s.id IN (SELECT session_id FROM session_skills WHERE skill_name IN ({placeholders}))"
+            params.extend(skills)
+
+        if tags:
+            tag_checks = " OR ".join(
+                "loreconvo_tag_matches(s.tags, ?) = 1" for _ in tags
+            )
+            sql += (
+                f" AND ({tag_checks})"
+            )
+            params.extend(tags)
+
+        sql += " ORDER BY sessions_fts.rank LIMIT ?"
+        params.append(limit)
+
+        rows = self.conn.execute(sql, params).fetchall()
+        results = []
+        for row in rows:
+            session = self._row_to_session(row)
+            results.append(SearchResult(
+                session=session,
+                match_score=abs(row["rank"]) if row["rank"] else 0.0
+            ))
+
+        return results
+
+    def get_context_for(
+        self,
+        topic: str,
+        max_results: int = 5,
+        include_external: bool = False,
+        semantic: bool = False,
+        half_life_days: int = SEARCH_HALF_LIFE_DAYS,
+    ) -> List[SearchResult]:
+        # SH-103918: normalize the topic for project-name tolerance.
+        # When the topic looks like a project identifier, also run a
+        # project-filtered search so sessions under that project are
+        # found even if the exact spelling only appears in the project
+        # column (not in the FTS5-indexed text).
+        normalized_topic = normalize_project_name(topic) if topic else topic
+        fts_results = self.search_sessions(
+            query=topic,
+            limit=max_results,
+            include_external=include_external,
+        )
+        if semantic and self.config.is_pro:
+            lance = self._get_lance_index()
+            if lance.is_available():
+                session_ids = lance.search(
+                    topic,
+                    limit=max_results * 3,
+                    half_life_days=half_life_days,
+                )
+                if session_ids:
+                    sem_results = self._fetch_sessions_for_semantic(
+                        session_ids, None, None, None, max_results, include_external
+                    )
+                    # Merge: semantic first, then FTS to fill remaining slots
+                    sem_ids = {r.session.id for r in sem_results}
+                    merged = list(sem_results)
+                    for r in fts_results:
+                        if r.session.id not in sem_ids and len(merged) < max_results:
+                            merged.append(r)
+                    return merged
+        # If normalized topic differs from original AND is non-empty,
+        # also do a project-filtered search and merge (dedup by session id).
+        if normalized_topic and normalized_topic != (topic or "").strip().lower():
+            proj_results = self.search_sessions(
+                query=normalized_topic,
+                project=normalized_topic,
+                limit=max_results,
+                include_external=include_external,
+            )
+            seen = {r.session.id for r in fts_results}
+            merged = list(fts_results)
+            for r in proj_results:
+                if r.session.id not in seen and len(merged) < max_results:
+                    merged.append(r)
+                    seen.add(r.session.id)
+            return merged[:max_results]
+        return fts_results[:max_results]
+
+    def list_all_skills(self) -> List[dict]:
+        """Return all distinct skill names with session counts, sorted by use count desc."""
+        rows = self.conn.execute(
+            """SELECT skill_name, COUNT(*) as session_count
+               FROM session_skills
+               GROUP BY skill_name
+               ORDER BY session_count DESC, skill_name ASC"""
+        ).fetchall()
+        return [{"skill_name": r["skill_name"], "session_count": r["session_count"]} for r in rows]
+
+    def get_skill_history(
+        self, skill_name: str, days_back: int = 90
+    ) -> List[Session]:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days_back)).isoformat().replace('+00:00', 'Z')
+        rows = self.conn.execute(
+            """SELECT s.* FROM sessions s
+               JOIN session_skills sk ON s.id = sk.session_id
+               WHERE sk.skill_name = ? AND s.start_date >= ?
+               ORDER BY s.start_date DESC""",
+            (skill_name, cutoff)
+        ).fetchall()
+        return [self._row_to_session(r) for r in rows]
+
+    # -- Agent context injection (SH-12766) --
+
+    @staticmethod
+    def _validate_agent_context_agent_name(agent_name: str) -> None:
+        if not isinstance(agent_name, str) or not _AGENT_NAME_RE.match(agent_name):
+            raise ValueError("invalid_agent_name")
+
+    @staticmethod
+    def _validate_agent_context_project(project: str) -> None:
+        if not isinstance(project, str) or not _AGENT_CONTEXT_PROJECT_RE.match(project):
+            raise ValueError("invalid_project")
+
+    @staticmethod
+    def _normalize_agent_context_topics(topics: List[str]) -> List[str]:
+        """Strip/lower/dedupe topics per PART:data-model. Raises ValueError with
+        one of the tool's documented error codes (invalid_topics,
+        too_many_topics, duplicate_topics) -- server.py maps these directly
+        to the MCP error response.
+        """
+        if not isinstance(topics, list) or not all(isinstance(t, str) for t in topics):
+            raise ValueError("invalid_topics")
+        if not topics:
+            raise ValueError("invalid_topics")
+        if len(topics) > MAX_TOPICS_PER_CONFIG:
+            raise ValueError("too_many_topics")
+        normalized = []
+        seen = set()
+        for raw in topics:
+            cleaned = "".join(ch for ch in raw if ch == "\t" or ord(ch) >= 0x20)
+            cleaned = cleaned.strip().lower()
+            if not cleaned or len(cleaned) > _AGENT_CONTEXT_TOPIC_MAX_LEN:
+                raise ValueError("invalid_topics")
+            if cleaned in seen:
+                raise ValueError("duplicate_topics")
+            seen.add(cleaned)
+            normalized.append(cleaned)
+        return normalized
+
+    def configure_agent_context(
+        self,
+        agent_name: str,
+        project: str,
+        topics: List[str],
+        max_results_per_topic: int = 3,
+        enabled: bool = True,
+        retire: bool = False,
+    ) -> dict:
+        """Store or update a named topic configuration for an agent. Atomic upsert.
+
+        `retire=True` sets status='retired' (soft-disable path, PART:data-model);
+        any other write sets status='active' and clears retired_at, which is how
+        a previously retired config gets reactivated.
+
+        Returns {"topic_count": int, "reactivated_retired_config": bool}.
+        Raises ValueError(<error code>) on validation failure -- server.py
+        catches this and maps it to the MCP tool's {"status": "error", ...}
+        response; this method never returns an error dict itself.
+        """
+        self._validate_agent_context_agent_name(agent_name)
+        self._validate_agent_context_project(project)
+        if not isinstance(max_results_per_topic, int) or isinstance(max_results_per_topic, bool) \
+                or not (1 <= max_results_per_topic <= 10):
+            raise ValueError("invalid_max_results")
+        normalized_topics = self._normalize_agent_context_topics(topics)
+        status = "retired" if retire else "active"
+        retired_at_expr = "strftime('%Y-%m-%dT%H:%M:%SZ', 'now')" if retire else "NULL"
+
+        with self._write_context() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT status FROM agent_context_configs WHERE agent_name = ? AND project = ?",
+                    (agent_name, project),
+                ).fetchone()
+                reactivated = bool(row and row["status"] == "retired" and not retire)
+
+                conn.execute(
+                    f"""
+                    INSERT INTO agent_context_configs
+                        (agent_name, project, topics_json, max_results_per_topic,
+                         enabled, status, retired_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, {retired_at_expr},
+                            strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+                    ON CONFLICT(agent_name, project) DO UPDATE SET
+                        topics_json = excluded.topics_json,
+                        max_results_per_topic = excluded.max_results_per_topic,
+                        enabled = excluded.enabled,
+                        status = excluded.status,
+                        retired_at = excluded.retired_at,
+                        updated_at = excluded.updated_at
+                    """,
+                    (agent_name, project, json.dumps(normalized_topics),
+                     max_results_per_topic, 1 if enabled else 0, status),
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+        logger.info(
+            "agent_context configured: agent_name=%s project=%s topic_count=%d enabled=%s",
+            agent_name, project, len(normalized_topics), enabled,
+        )
+        return {
+            "topic_count": len(normalized_topics),
+            "reactivated_retired_config": reactivated,
+        }
+
+    def get_agent_context_config(self, agent_name: str, project: str) -> Optional[dict]:
+        """Read the stored config row (any status) for (agent_name, project), or None."""
+        row = self.conn.execute(
+            "SELECT * FROM agent_context_configs WHERE agent_name = ? AND project = ?",
+            (agent_name, project),
+        ).fetchone()
+        if row is None:
+            return None
+        config = dict(row)
+        config["topics"] = json.loads(config.pop("topics_json") or "[]")
+        config["enabled"] = bool(config["enabled"])
+        return config
+
+    def touch_agent_context_last_used(self, agent_name: str, project: str) -> None:
+        """Update last_used_at on a successful inject_agent_context call."""
+        with self._write_context() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    "UPDATE agent_context_configs SET last_used_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') "
+                    "WHERE agent_name = ? AND project = ?",
+                    (agent_name, project),
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+    def rollback_agent_context_tables(self, backup_dir: Optional[Path] = None) -> str:
+        """Export agent_context_configs to a JSON backup, then DROP the table.
+
+        Admin/recovery operation -- not exposed via MCP. Mirrors the proposal's
+        rollback procedure (PART:migration): retries BEGIN EXCLUSIVE up to 3
+        times with backoff [H-M2], checks table existence before SELECT
+        [H-M3], chmod 600 on the backup file / 700 on the backup dir [H-M4].
+        No PRAGMA user_version bookkeeping -- this feature's migration doesn't
+        use it (see _migrate_add_agent_context_configs docstring); the table
+        is simply recreated idempotently on the next startup.
+        """
+        import time
+
+        ts = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H%M%SZ')
+
+        if backup_dir is None:
+            backup_dir = Path(self.config.db_path).parent
+        backup_dir = Path(backup_dir)
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(str(backup_dir), 0o700)
+
+        backup_path = backup_dir / f"agent_context_backup_{ts}.json"
+        tmp_path = backup_path.with_suffix(".tmp")
+
+        with self._write_context() as conn:
+            for attempt in range(3):
+                try:
+                    conn.execute("BEGIN EXCLUSIVE")
+                    break
+                except sqlite3.OperationalError as exc:
+                    if "database is locked" not in str(exc).lower() or attempt == 2:
+                        raise RuntimeError(
+                            "Could not acquire exclusive lock for rollback after 3 attempts. "
+                            "Ensure all LoreConvo processes are stopped and retry."
+                        ) from exc
+                    time.sleep(0.5 * (attempt + 1))
+
+            try:
+                extant = {
+                    r[0] for r in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' "
+                        "AND name='agent_context_configs'"
+                    )
+                }
+                configs = (
+                    conn.execute("SELECT * FROM agent_context_configs").fetchall()
+                    if "agent_context_configs" in extant else []
+                )
+                backup = {
+                    "schema_version": 1,
+                    "exported_at": ts,
+                    "configs": [dict(r) for r in configs],
+                }
+                tmp_path.write_text(json.dumps(backup, indent=2))
+                parsed = json.loads(tmp_path.read_text())
+                assert len(parsed["configs"]) == len(configs), \
+                    "Backup verify: config count mismatch"
+                os.replace(str(tmp_path), str(backup_path))
+                os.chmod(str(backup_path), 0o600)
+
+                if "agent_context_configs" in extant:
+                    conn.execute("DROP TABLE IF EXISTS agent_context_configs")
+                conn.execute("COMMIT")
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+                if tmp_path.exists():
+                    tmp_path.unlink(missing_ok=True)
+                raise
+
+        return str(backup_path)
+
+    # -- Persona operations --
+
+    def tag_session(
+        self, session_id: str, persona_name: str,
+        relevance_note: Optional[str] = None
+    ):
+        self.conn.execute(
+            """INSERT OR REPLACE INTO persona_sessions
+               (persona_name, session_id, relevance_note)
+               VALUES (?, ?, ?)""",
+            (persona_name, session_id, relevance_note)
+        )
+        self.conn.commit()
+
+    def get_persona_sessions(
+        self, persona_name: str, limit: int = 20
+    ) -> List[Session]:
+        rows = self.conn.execute(
+            """SELECT s.* FROM sessions s
+               JOIN persona_sessions ps ON s.id = ps.session_id
+               WHERE ps.persona_name LIKE ?
+               ORDER BY s.start_date DESC LIMIT ?""",
+            (persona_name + "%", limit)
+        ).fetchall()
+        return [self._row_to_session(r) for r in rows]
+
+    # -- Session linking --
+
+    def link_sessions(
+        self, from_id: str, to_id: str, link_type: str = "continues"
+    ):
+        self.conn.execute(
+            """INSERT OR REPLACE INTO session_links
+               (from_session_id, to_session_id, link_type)
+               VALUES (?, ?, ?)""",
+            (from_id, to_id, link_type)
+        )
+        self.conn.commit()
+
+    def get_session_chain(
+        self, session_id: str, include_auto: bool = False
+    ) -> List[Session]:
+        """Return the user-curated chain containing session_id.
+
+        A chain is the explicit narrative thread: sessions reachable through
+        link_sessions() links ('continues' / 'related' / 'supersedes').
+        Machine auto-links ('auto:cooccurrence', 'auto:embedding') are
+        similarity signals, not curation -- traversing them turned one
+        explicit link into a 12-session similarity blob (SH-101421).
+
+        include_auto=True opts into the similarity walk for callers that
+        genuinely want the connected component of the full link graph.
+        """
+        link_predicate = "link_type NOT LIKE 'auto:%'"
+        if include_auto:
+            link_predicate = "1=1"
+        chain_ids = set()
+        to_visit = [session_id]
+        while to_visit:
+            current = to_visit.pop(0)
+            if current in chain_ids:
+                continue
+            chain_ids.add(current)
+            links = self.conn.execute(
+                f"""SELECT to_session_id FROM session_links
+                    WHERE from_session_id = ? AND {link_predicate}
+                    UNION
+                    SELECT from_session_id FROM session_links
+                    WHERE to_session_id = ? AND {link_predicate}""",
+                (current, current)
+            ).fetchall()
+            for link in links:
+                to_visit.append(link[0])
+
+        sessions = []
+        for sid in chain_ids:
+            s = self.get_session(sid)
+            if s:
+                sessions.append(s)
+        sessions.sort(key=lambda s: s.start_date)
+        return sessions
+
+    # -- Project operations --
+
+    def create_project(
+        self, name: str, description: str = "",
+        expected_skills: Optional[List[str]] = None,
+        default_persona: Optional[str] = None,
+        instructions: Optional[str] = None,
+        session_id: Optional[str] = None
+    ):
+        old_row = self.conn.execute(
+            "SELECT instructions FROM projects WHERE name = ?", (name,)
+        ).fetchone()
+        old_instructions = old_row[0] if old_row else None
+
+        self.conn.execute(
+            """INSERT OR REPLACE INTO projects
+               (name, description, expected_skills, default_persona, instructions)
+               VALUES (?, ?, ?, ?, ?)""",
+            (name, description, json.dumps(expected_skills or []), default_persona, instructions)
+        )
+
+        if instructions != old_instructions:
+            self._audit_log_instruction_change(name, old_instructions, instructions, session_id)
+
+        self.conn.commit()
+
+    def _audit_log_instruction_change(
+        self, project_name: str, old_value: Optional[str],
+        new_value: Optional[str], session_id: Optional[str] = None
+    ):
+        """Log a change to project instructions for audit trail."""
+        self.conn.execute(
+            """INSERT INTO project_instruction_audit
+               (project_name, session_id, old_value, new_value)
+               VALUES (?, ?, ?, ?)""",
+            (project_name, session_id, old_value, new_value)
+        )
+
+    def get_project(self, project_name: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM projects WHERE name = ?", (project_name,)
+        ).fetchone()
+        if not row:
+            return None
+
+        sessions = self.get_recent_sessions(
+            limit=20, days_back=365, project=project_name
+        )
+
+        skill_counts = {}
+        for s in sessions:
+            skill_rows = self.conn.execute(
+                "SELECT skill_name, invocation_count FROM session_skills WHERE session_id = ?",
+                (s.id,)
+            ).fetchall()
+            for sr in skill_rows:
+                skill_counts[sr["skill_name"]] = skill_counts.get(sr["skill_name"], 0) + sr["invocation_count"]
+
+        return {
+            "name": row["name"],
+            "description": row["description"],
+            "expected_skills": json.loads(row["expected_skills"] or "[]"),
+            "default_persona": row["default_persona"],
+            "instructions": row["instructions"],
+            "session_count": len(sessions),
+            "recent_sessions": [
+                {"id": s.id, "title": s.title, "date": s.start_date}
+                for s in sessions[:10]
+            ],
+            "skill_usage": dict(sorted(skill_counts.items(), key=lambda x: -x[1]))
+        }
+
+    def list_projects(self) -> List[dict]:
+        rows = self.conn.execute("""
+            SELECT p.name, p.description,
+                   COUNT(s.id) AS session_count
+            FROM projects p
+            LEFT JOIN sessions s ON s.project = p.name
+            GROUP BY p.name, p.description
+            ORDER BY p.name
+        """).fetchall()
+        return [
+            {
+                "name": row["name"],
+                "description": row["description"],
+                "session_count": row["session_count"]
+            }
+            for row in rows
+        ]
+
+    # -- Suggestions --
+
+    def get_suggestions(
+        self, project: Optional[str] = None,
+        persona: Optional[str] = None,
+        days_back: int = 14, limit: int = 5
+    ) -> dict:
+        """Generate proactive context suggestions.
+
+        Finds sessions worth revisiting based on:
+        - Unresolved open questions
+        - Recent decisions that may need follow-up
+        - Skill gaps (expected by project but not used recently)
+
+        When a project is specified and returns empty results, automatically expands
+        the search window to older sessions (progressively: 30, 90, 365 days, all-time).
+        """
+        normalized_project = normalize_project_name(project)
+        result = self._get_suggestions_with_window(project, persona, days_back, limit)
+
+        if result["suggestions"] or not normalized_project:
+            return result
+
+        project_has_sessions = self.conn.execute(
+            "SELECT COUNT(*) as c FROM sessions WHERE project = ?",
+            (normalized_project,)
+        ).fetchone()["c"] > 0
+
+        if not project_has_sessions:
+            return result
+
+        for expanded_days in [30, 90, 365, 36500]:
+            expanded_result = self._get_suggestions_with_window(project, persona, expanded_days, limit)
+            if expanded_result["suggestions"]:
+                # Preserve initial skill_gaps when merging with expanded suggestions
+                expanded_result["skill_gaps"] = result["skill_gaps"]
+                expanded_result["metadata"]["window_expanded"] = True
+                expanded_result["metadata"]["expanded_to_days"] = expanded_days
+                expanded_result["metadata"]["expansion_note"] = "No results in initial %d-day window; expanded to %d days" % (days_back, expanded_days)
+                expanded_result["metadata"]["initial_days_back"] = days_back
+                return expanded_result
+
+        expanded_result = self._get_suggestions_with_window(project, persona, 36500, limit)
+        # Preserve initial skill_gaps in final all-time window result
+        expanded_result["skill_gaps"] = result["skill_gaps"]
+        expanded_result["metadata"]["window_expanded"] = True
+        expanded_result["metadata"]["expanded_to_days"] = 36500
+        expanded_result["metadata"]["expansion_note"] = "No suggestions found even after expanding to all-time window"
+        expanded_result["metadata"]["initial_days_back"] = days_back
+        return expanded_result
+
+    def _get_suggestions_with_window(
+        self, project: Optional[str] = None,
+        persona: Optional[str] = None,
+        days_back: int = 14, limit: int = 5
+    ) -> dict:
+        """Get suggestions with a specific window. Internal helper method."""
+        normalized_project = normalize_project_name(project)
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days_back)).isoformat().replace('+00:00', 'Z')
+        suggestions = []
+
+        # 1. Sessions with open questions (highest priority)
+        oq_sql = """
+            SELECT * FROM sessions
+            WHERE start_date >= ?
+              AND open_questions IS NOT NULL
+              AND open_questions != '[]'
+        """
+        oq_params: list = [cutoff]
+        if normalized_project:
+            oq_sql += " AND project = ?"
+            oq_params.append(normalized_project)
+        if persona:
+            oq_sql += " AND id IN (SELECT session_id FROM persona_sessions WHERE persona_name LIKE ?)"
+            oq_params.append(persona + "%")
+        oq_sql += " ORDER BY start_date DESC"
+
+        rows = self.conn.execute(oq_sql, oq_params).fetchall()
+        for row in rows:
+            session = self._row_to_session(row)
+            if session.open_questions:
+                suggestions.append({
+                    "session_id": session.id,
+                    "title": session.title,
+                    "date": session.start_date,
+                    "reason": "Has %d unresolved open question(s)" % len(session.open_questions),
+                    "type": "open_questions",
+                    "priority": 1,
+                    "open_questions": session.open_questions,
+                    "summary_preview": session.summary[:300] + "..." if len(session.summary) > 300 else session.summary,
+                })
+
+        # 2. Sessions with decisions worth reviewing
+        dec_sql = """
+            SELECT * FROM sessions
+            WHERE start_date >= ?
+              AND decisions IS NOT NULL
+              AND decisions != '[]'
+        """
+        dec_params: list = [cutoff]
+        if normalized_project:
+            dec_sql += " AND project = ?"
+            dec_params.append(normalized_project)
+        if persona:
+            dec_sql += " AND id IN (SELECT session_id FROM persona_sessions WHERE persona_name LIKE ?)"
+            dec_params.append(persona + "%")
+        dec_sql += " ORDER BY start_date DESC"
+
+        seen_ids = {s["session_id"] for s in suggestions}
+        rows = self.conn.execute(dec_sql, dec_params).fetchall()
+        for row in rows:
+            session = self._row_to_session(row)
+            if session.id not in seen_ids and len(session.decisions) >= 2:
+                suggestions.append({
+                    "session_id": session.id,
+                    "title": session.title,
+                    "date": session.start_date,
+                    "reason": "Contains %d key decisions worth reviewing" % len(session.decisions),
+                    "type": "decisions",
+                    "priority": 2,
+                    "decisions": session.decisions,
+                    "summary_preview": session.summary[:300] + "..." if len(session.summary) > 300 else session.summary,
+                })
+                seen_ids.add(session.id)
+
+        # 3. Skill gaps (project expected_skills not used recently)
+        skill_gaps = []
+        if normalized_project:
+            proj_row = self.conn.execute(
+                "SELECT expected_skills FROM projects WHERE name = ?",
+                (normalized_project,)
+            ).fetchone()
+            if proj_row:
+                expected = json.loads(proj_row["expected_skills"] or "[]")
+                if expected:
+                    recent_skills = self.conn.execute(
+                        """SELECT DISTINCT sk.skill_name
+                           FROM session_skills sk
+                           JOIN sessions s ON sk.session_id = s.id
+                           WHERE s.start_date >= ? AND s.project = ?""",
+                        (cutoff, normalized_project)
+                    ).fetchall()
+                    used = {r["skill_name"] for r in recent_skills}
+                    for skill in expected:
+                        if skill not in used:
+                            last = self.conn.execute(
+                                """SELECT s.start_date FROM sessions s
+                                   JOIN session_skills sk ON s.id = sk.session_id
+                                   WHERE sk.skill_name = ?
+                                   ORDER BY s.start_date DESC LIMIT 1""",
+                                (skill,)
+                            ).fetchone()
+                            skill_gaps.append({
+                                "skill": skill,
+                                "last_used": last["start_date"] if last else None,
+                                "reason": "Expected in project '%s' but not used in last %d days" % (project, days_back),
+                            })
+
+        # Sort by priority, then recency
+        suggestions.sort(key=lambda s: (s["priority"], s["date"]))
+        # Remove priority field from output, take top N
+        for s in suggestions:
+            del s["priority"]
+        suggestions = suggestions[:limit]
+
+        total_scanned = self.conn.execute(
+            "SELECT COUNT(*) as c FROM sessions WHERE start_date >= ?",
+            (cutoff,)
+        ).fetchone()["c"]
+
+        return {
+            "suggestions": suggestions,
+            "skill_gaps": skill_gaps,
+            "metadata": {
+                "total_sessions_scanned": total_scanned,
+                "days_back": days_back,
+                "suggestions_returned": len(suggestions),
+                "project_filter": project,
+                "persona_filter": persona,
+                "window_expanded": False,
+            }
+        }
+
+    # -- Helpers --
+
+    @staticmethod
+    def _parse_json_field(value, default="[]"):
+        """Parse a JSON field that may contain a raw string instead of a JSON array.
+
+        Handles three storage formats found in the database:
+        1. JSON array (current format):  '["tag1", "tag2"]'
+        2. Comma-separated string (legacy tags): 'tag1,tag2,tag3'
+        3. Plain text blob (Gina architecture proposals in decisions field)
+
+        Always returns a list so callers never need to handle multiple types.
+        """
+        raw = value or default
+        try:
+            result = json.loads(raw)
+            if not isinstance(result, list):
+                return [str(result)]
+            return result
+        except (json.JSONDecodeError, ValueError):
+            if not raw or raw == default:
+                return []
+            # Legacy comma-separated tags (e.g. 'security,supply-chain,audit')
+            # Detect by checking whether the string looks like a CSV tag list:
+            # short tokens, no spaces, commas present.
+            stripped = raw.strip().rstrip(',')
+            tokens = [t.strip() for t in stripped.split(',') if t.strip()]
+            all_short = all(len(t) <= 60 and ' ' not in t for t in tokens)
+            if len(tokens) > 1 and all_short:
+                return tokens
+            # Plain text blob (architecture proposals, free-form text) -- keep as one item
+            return [raw]
+
+    def _row_to_session(self, row) -> Session:
+        row_keys = row.keys()
+        return Session(
+            id=row["id"],
+            title=row["title"],
+            surface=row["surface"],
+            project=row["project"],
+            start_date=row["start_date"],
+            end_date=row["end_date"],
+            summary=row["summary"] or "",
+            decisions=self._parse_json_field(row["decisions"]),
+            artifacts=self._parse_json_field(row["artifacts"]),
+            open_questions=self._parse_json_field(row["open_questions"]),
+            tags=self._parse_json_field(row["tags"]),
+            created_at=row["created_at"] or "",
+            source=row["source"] if "source" in row_keys else "session",
+            shared_by=row["shared_by"] if "shared_by" in row_keys else None,
+            origin_machine=row["origin_machine"] if "origin_machine" in row_keys else None,
+            content_hash=row["content_hash"] if "content_hash" in row_keys else None,
+            external_tool_session=bool(row["external_tool_session"]) if "external_tool_session" in row_keys else False,
+            reasoning_notes=row["reasoning_notes"] if "reasoning_notes" in row_keys else None,
+            previous_summary=row["previous_summary"] if "previous_summary" in row_keys else None,
+            keep_forever=bool(row["keep_forever"]) if "keep_forever" in row_keys else False,
+            expires_at=row["expires_at"] if "expires_at" in row_keys else None,
+            staleness_hint=row["staleness_hint"] if "staleness_hint" in row_keys else None,
+        )
+
+    def get_sessions_for_shared_export(
+        self,
+        project: Optional[str] = None,
+        session_id_filter: Optional[List[str]] = None,
+        export_all: bool = False,
+    ) -> List[Session]:
+        """Return sessions formatted for team-memory shared export.
+
+        SEC-00071: source='periodic' sessions are excluded.
+        SH-10121: external_tool_session sessions excluded -- re-exporting imported
+        sessions creates circular contamination once Phase 3 import lands.
+        """
+        _exclusion_enabled = os.environ.get("LORECONVO_EXTERNAL_TOOL_EXCLUSION", "1") != "0"
+        query = "SELECT * FROM sessions WHERE (source IS NULL OR source NOT IN ('periodic', 'file_memory'))"
+        if _exclusion_enabled:
+            query += " AND (external_tool_session IS NULL OR external_tool_session = 0)"
+        params: list = []
+
+        if not export_all:
+            if session_id_filter:
+                placeholders = ",".join("?" * len(session_id_filter))
+                query += f" AND id IN ({placeholders})"
+                params.extend(session_id_filter)
+            elif project:
+                query += " AND project = ?"
+                params.append(project)
+
+        query += " ORDER BY start_date DESC LIMIT 1000"
+        rows = self.conn.execute(query, params).fetchall()
+        return [self._row_to_session(r) for r in rows]
+
+    def merge_session(self, session_dict: dict, shared_by: str) -> str:
+        """Import one session from a shared export dict. Returns 'imported' or 'skipped'.
+
+        SEC-00067: skip-on-exist only, no replace option.
+        SEC-00068: field length caps applied before any DB insert.
+        SEC-00069: content_hash always recomputed locally; imported value is ignored.
+        """
+        session_id = str(session_dict.get("id", "")).strip()
+        if not session_id:
+            return "skipped"
+
+        # UUID-exists check (exact duplicate)
+        if self.conn.execute(
+            "SELECT id FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone():
+            return "skipped"
+
+        # Apply field caps (SEC-00068)
+        title = str(session_dict.get("title", "") or "")[:_IMPORT_FIELD_CAPS["title"]]
+        summary = str(session_dict.get("summary", "") or "")[:_IMPORT_FIELD_CAPS["summary"]]
+        created_at = str(session_dict.get("created_at", "") or "")
+
+        # Recompute content_hash locally; never trust the imported value (SEC-00069)
+        local_hash = self.compute_content_hash(title, summary, created_at)
+
+        # Content-hash dedup (same content, different UUID path)
+        if self.conn.execute(
+            "SELECT id FROM sessions WHERE content_hash = ?", (local_hash,)
+        ).fetchone():
+            return "skipped"
+
+        tags = [str(t)[:_IMPORT_FIELD_CAPS["list_item"]]
+                for t in (session_dict.get("tags") or [])]
+        decisions = [str(d)[:_IMPORT_FIELD_CAPS["list_item"]]
+                     for d in (session_dict.get("decisions") or [])]
+        open_questions = [str(q)[:_IMPORT_FIELD_CAPS["list_item"]]
+                          for q in (session_dict.get("open_questions") or [])]
+        # SEC-00070: strip artifacts to basename only
+        import os as _os
+        artifacts = [_os.path.basename(str(a)) for a in (session_dict.get("artifacts") or [])]
+
+        surface = str(session_dict.get("surface", "") or "")
+        project = session_dict.get("project") or None
+        origin_machine = str(session_dict.get("origin_machine", "") or "")
+
+        self.conn.execute(
+            """INSERT OR IGNORE INTO sessions
+               (id, title, surface, project, start_date, end_date, summary,
+                decisions, artifacts, open_questions, tags, created_at, source,
+                shared_by, origin_machine, content_hash)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                session_id, title, surface, project,
+                created_at, None, summary,
+                json.dumps(decisions), json.dumps(artifacts),
+                json.dumps(open_questions), json.dumps(tags),
+                created_at, "imported",
+                shared_by, origin_machine, local_hash,
+            )
+        )
+        self.conn.commit()
+        return "imported"
+
+    def session_exists(self, session_id: str) -> bool:
+        row = self.conn.execute(
+            "SELECT id FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        return row is not None
+
+    def session_count(self) -> int:
+        row = self.conn.execute(
+            "SELECT COUNT(*) as c FROM sessions WHERE source IS NULL OR source != 'file_memory'"
+        ).fetchone()
+        return row["c"]
+
+    def inspect_sessions(
+        self,
+        search: Optional[str] = None,
+        tag: Optional[str] = None,
+        surface: Optional[str] = None,
+        since: Optional[str] = None,
+        limit: int = 20,
+    ) -> List[Session]:
+        """Return sessions matching inspect filters."""
+        if search:
+            results = self.search_sessions(search, limit=limit)
+            sessions = [r.session for r in results]
+            sessions = [s for s in sessions if s.source not in ('periodic', 'file_memory')]
+            if surface:
+                sessions = [s for s in sessions if s.surface == surface]
+            if tag:
+                sessions = [s for s in sessions if any(tag in t for t in s.tags)]
+            if since:
+                sessions = [s for s in sessions if s.start_date >= since]
+            return sessions[:limit]
+
+        query = "SELECT * FROM sessions WHERE (source IS NULL OR source NOT IN ('periodic', 'file_memory'))"
+        params: list = []
+
+        if since:
+            query += " AND start_date >= ?"
+            params.append(since)
+        if surface:
+            query += " AND surface = ?"
+            params.append(surface)
+        if tag:
+            query += " AND tags LIKE ?"
+            params.append(f'%{tag}%')
+
+        query += " ORDER BY start_date DESC LIMIT ?"
+        params.append(limit)
+
+        rows = self.conn.execute(query, params).fetchall()
+        return [self._row_to_session(r) for r in rows]
+
+    def get_inspect_stats(self) -> dict:
+        """Return aggregate stats for inspect --show-stats."""
+        _src_filter = "(source IS NULL OR source NOT IN ('periodic', 'file_memory'))"
+        total = self.conn.execute(
+            f"SELECT COUNT(*) as c FROM sessions WHERE {_src_filter}"
+        ).fetchone()["c"]
+        by_surface = self.conn.execute(
+            f"SELECT surface, COUNT(*) as c FROM sessions WHERE {_src_filter} "
+            "GROUP BY surface ORDER BY c DESC"
+        ).fetchall()
+        by_project = self.conn.execute(
+            f"SELECT project, COUNT(*) as c FROM sessions WHERE {_src_filter} "
+            "AND project IS NOT NULL GROUP BY project ORDER BY c DESC LIMIT 10"
+        ).fetchall()
+        with_oq = self.conn.execute(
+            f"SELECT COUNT(*) as c FROM sessions WHERE {_src_filter} "
+            "AND open_questions IS NOT NULL AND open_questions != '[]'"
+        ).fetchone()["c"]
+        return {
+            "total": total,
+            "by_surface": {r["surface"]: r["c"] for r in by_surface},
+            "by_project": {r["project"]: r["c"] for r in by_project},
+            "with_open_questions": with_oq,
+        }
+
+    def delete_session(self, session_id: str) -> bool:
+        """Delete a session by ID. Returns True if deleted, False if not found or pinned.
+
+        Pinned sessions (keep_forever=1) cannot be deleted; unpin first.
+        All deletes are routed through sessions_prunable to honour the
+        keep_forever enforcement layer.
+        """
+        row = self.conn.execute(
+            "SELECT keep_forever FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        if not row:
+            return False
+        if row["keep_forever"]:
+            return False  # caller should surface "unpin first" guidance
+        self.conn.execute("DELETE FROM session_skills WHERE session_id = ?", (session_id,))
+        self.conn.execute("DELETE FROM persona_sessions WHERE session_id = ?", (session_id,))
+        self.conn.execute(
+            "DELETE FROM session_links WHERE from_session_id = ? OR to_session_id = ?",
+            (session_id, session_id)
+        )
+        self.conn.execute("DELETE FROM sessions_prunable WHERE id = ?", (session_id,))
+        self.conn.commit()
+        return True
+
+    def get_usage_stats(self) -> dict:
+        """Return aggregate usage statistics for the get_stats MCP tool.
+
+        Excludes periodic snapshots and file_memory entries (internal sources).
+        """
+        _s = _INTERNAL_SOURCES
+
+        total = self.conn.execute(
+            "SELECT COUNT(*) as c FROM sessions "
+            "WHERE (source IS NULL OR source NOT IN (?, ?))",
+            _s,
+        ).fetchone()["c"]
+
+        by_surface = self.conn.execute(
+            "SELECT surface, COUNT(*) as c FROM sessions "
+            "WHERE (source IS NULL OR source NOT IN (?, ?)) "
+            "GROUP BY surface ORDER BY c DESC",
+            _s,
+        ).fetchall()
+
+        by_project = self.conn.execute(
+            "SELECT COALESCE(project, '(none)') as project, COUNT(*) as c "
+            "FROM sessions WHERE (source IS NULL OR source NOT IN (?, ?)) "
+            "GROUP BY project ORDER BY c DESC LIMIT 10",
+            _s,
+        ).fetchall()
+
+        recent_5 = self.conn.execute(
+            "SELECT title, start_date, surface, project FROM sessions "
+            "WHERE (source IS NULL OR source NOT IN (?, ?)) "
+            "ORDER BY start_date DESC LIMIT 5",
+            _s,
+        ).fetchall()
+
+        # Tag breakdown: parse JSON tags column in Python
+        tag_rows = self.conn.execute(
+            "SELECT tags FROM sessions "
+            "WHERE tags IS NOT NULL AND tags != '[]' "
+            "AND (source IS NULL OR source NOT IN (?, ?))",
+            _s,
+        ).fetchall()
+        tag_counts: dict = {}
+        for row in tag_rows:
+            for tag in self._parse_json_field(row["tags"]):
+                tag_counts[tag] = tag_counts.get(tag, 0) + 1
+        top_tags = dict(sorted(tag_counts.items(), key=lambda x: -x[1])[:10])
+
+        # Storage metrics
+        db_size_bytes = 0
+        if os.path.exists(self.config.db_path):
+            db_size_bytes = os.path.getsize(self.config.db_path)
+
+        char_count_row = self.conn.execute(
+            "SELECT SUM(LENGTH(COALESCE(title,'')) + LENGTH(COALESCE(summary,'')) + "
+            "LENGTH(COALESCE(decisions,'')) + LENGTH(COALESCE(open_questions,''))) as total_chars "
+            "FROM sessions WHERE (source IS NULL OR source NOT IN (?, ?))",
+            _s,
+        ).fetchone()
+        total_chars = char_count_row["total_chars"] or 0
+
+        result = {
+            "total_sessions": total,
+            "by_surface": {r["surface"]: r["c"] for r in by_surface},
+            "by_project": {r["project"]: r["c"] for r in by_project},
+            "top_tags": top_tags,
+            "recent_sessions": [
+                {
+                    "title": r["title"],
+                    "date": r["start_date"][:10] if r["start_date"] else "",
+                    "surface": r["surface"],
+                    "project": r["project"],
+                }
+                for r in recent_5
+            ],
+            "storage": {
+                "db_size_bytes": db_size_bytes,
+                "db_size_mb": round(db_size_bytes / (1024 * 1024), 2),
+                "estimated_tokens": total_chars // 4,
+            },
+        }
+
+        # LanceDB index stats (Pro only)
+        if self.config.is_pro:
+            try:
+                lance_index = self._get_lance_index()
+                if lance_index.is_available():
+                    # Include coverage check (SH-103940)
+                    coverage = self.check_lance_coverage()
+                    result["semantic_index"] = {
+                        "available": True,
+                        "sessions_indexed": lance_index.row_count(),
+                        "eligible_sessions": coverage["eligible_sessions"],
+                        "coverage_pct": coverage["coverage_pct"],
+                    }
+                    if coverage.get("warning"):
+                        result["semantic_index"]["warning"] = coverage["warning"]
+                else:
+                    result["semantic_index"] = {
+                        "available": False,
+                        "message": "Index not yet built. Call rebuild_index() to create it.",
+                    }
+            except Exception:
+                result["semantic_index"] = {"available": False, "message": "Could not read index."}
+
+        return result
+
+    def check_lance_coverage(self) -> dict:
+        """Check Lance index coverage against eligible SQLite sessions (Pro only).
+
+        Compares the Lance index row count to the number of SQLite sessions
+        that pass the _should_index filter.  When coverage is critically low
+        (< 50%), logs a warning so the gap is visible to operators and users
+        rather than silently degrading semantic search recall.
+
+        Returns a dict with:
+          coverage_pct: float (0-100), 0 when no index exists
+          lance_rows: int
+          eligible_sessions: int
+          warning: str or None
+        """
+        if not self.config.is_pro:
+            return {
+                "coverage_pct": 0,
+                "lance_rows": 0,
+                "eligible_sessions": 0,
+                "warning": None,
+            }
+
+        # Count eligible sessions using the same filters as rebuild_lance_index
+        rows = self.conn.execute(
+            "SELECT id, title, summary, external_tool_session, source FROM sessions "
+            "WHERE id IS NOT NULL AND title IS NOT NULL"
+        ).fetchall()
+
+        from .hybrid_search import _should_index
+        eligible = 0
+        for r in rows:
+            ext = bool(r["external_tool_session"]) if r["external_tool_session"] else False
+            src = r["source"]
+            title = r["title"]
+            summary = r["summary"]
+            if title and summary is not None and _should_index(title, ext, src, summary):
+                eligible += 1
+
+        try:
+            lance = self._get_lance_index()
+            lance_rows = lance.row_count() if lance.is_available() else 0
+        except Exception:
+            lance_rows = 0
+
+        if eligible > 0:
+            coverage_pct = round(100.0 * lance_rows / eligible, 1)
+        else:
+            coverage_pct = 100.0 if lance_rows == 0 else 0.0
+
+        warning = None
+        if eligible > 0 and coverage_pct < 50.0:
+            warning = (
+                "Lance index coverage is critically low: "
+                f"{lance_rows}/{eligible} sessions indexed ({coverage_pct}%). "
+                "Semantic search recall will be severely degraded. "
+                "Run rebuild_index() to backfill missing sessions."
+            )
+            import logging as _log
+            _log.getLogger(__name__).warning("Lance coverage gap: %s", warning)
+
+        return {
+            "coverage_pct": coverage_pct,
+            "lance_rows": lance_rows,
+            "eligible_sessions": eligible,
+            "warning": warning,
+        }
+
+
+    def upsert_memory_digest(self, project: str, surface: Optional[str], data: dict) -> None:
+        """Insert or update a memory digest keyed by (project, surface)."""
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        source_session_ids = data.get("source_session_ids")
+        source_session_ids_json = (
+            json.dumps(source_session_ids)
+            if source_session_ids is not None
+            else None
+        )
+        existing = self.conn.execute(
+            "SELECT id FROM memory_digests WHERE project=? AND surface IS ?",
+            (project, surface)
+        ).fetchone()
+        if existing:
+            self.conn.execute(
+                """UPDATE memory_digests SET
+                   updated_at=?,
+                   source_count=COALESCE(?,source_count),
+                   oldest_session_date=COALESCE(?,oldest_session_date),
+                   newest_session_date=COALESCE(?,newest_session_date),
+                   decisions=COALESCE(?,decisions),
+                   open_questions=COALESCE(?,open_questions),
+                   known_stack=COALESCE(?,known_stack),
+                   stale_facts=COALESCE(?,stale_facts),
+                   digest_markdown=COALESCE(?,digest_markdown),
+                   mode=COALESCE(?,mode),
+                   tier=COALESCE(?,tier),
+                   api_key_found=COALESCE(?,api_key_found),
+                   source_session_ids=COALESCE(?,source_session_ids),
+                   safety_invalidated=CASE WHEN ? IS NOT NULL THEN 0
+                                           ELSE safety_invalidated END
+                   WHERE project=? AND surface IS ?""",
+                (
+                    now,
+                    data.get("source_count"),
+                    data.get("oldest_session_date"),
+                    data.get("newest_session_date"),
+                    data.get("decisions"),
+                    data.get("open_questions"),
+                    data.get("known_stack"),
+                    data.get("stale_facts"),
+                    data.get("digest_markdown"),
+                    data.get("mode"),
+                    data.get("tier"),
+                    data.get("api_key_found"),
+                    source_session_ids_json,
+                    source_session_ids_json,
+                    project, surface,
+                )
+            )
+        else:
+            digest_id = __import__("uuid").uuid4().hex
+            self.conn.execute(
+                """INSERT INTO memory_digests
+                   (id, project, surface, created_at, updated_at,
+                    source_count, oldest_session_date, newest_session_date,
+                    decisions, open_questions, known_stack, stale_facts,
+                    digest_markdown, mode, tier, api_key_found,
+                    source_session_ids, safety_invalidated)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)""",
+                (
+                    digest_id, project, surface, now, now,
+                    data.get("source_count", 0),
+                    data.get("oldest_session_date"),
+                    data.get("newest_session_date"),
+                    data.get("decisions"),
+                    data.get("open_questions"),
+                    data.get("known_stack"),
+                    data.get("stale_facts"),
+                    data.get("digest_markdown"),
+                    data.get("mode", "heuristic"),
+                    data.get("tier", "free"),
+                    data.get("api_key_found", 1),
+                    source_session_ids_json,
+                )
+            )
+        self.conn.commit()
+
+    def _digest_sources_are_eligible(self, digest: dict) -> bool:
+        """Return whether every recorded source is still recall-eligible."""
+        if digest.get("safety_invalidated"):
+            return False
+        try:
+            source_ids = json.loads(digest.get("source_session_ids") or "null")
+        except (TypeError, json.JSONDecodeError):
+            return False
+        if (
+            not isinstance(source_ids, list)
+            or not source_ids
+            or any(not isinstance(item, str) or not item for item in source_ids)
+            or len(set(source_ids)) != len(source_ids)
+            or digest.get("source_count") != len(source_ids)
+        ):
+            return False
+
+        placeholders = ",".join("?" for _ in source_ids)
+        sql = (
+            "SELECT id FROM sessions "
+            f"WHERE id IN ({placeholders}) AND project=? "
+            "AND (source IS NULL OR source NOT IN ('periodic', 'file_memory')) "
+            "AND (expires_at IS NULL "
+            "OR julianday(expires_at) > julianday('now'))"
+        )
+        params: list = [*source_ids, digest["project"]]
+        if digest.get("surface") is not None:
+            sql += " AND surface=?"
+            params.append(digest["surface"])
+        exclusion_enabled = (
+            os.environ.get("LORECONVO_EXTERNAL_TOOL_EXCLUSION", "1") != "0"
+        )
+        if exclusion_enabled:
+            sql += " AND (external_tool_session IS NULL OR external_tool_session=0)"
+        rows = self.conn.execute(sql, params).fetchall()
+        return len(rows) == len(source_ids)
+
+    def get_memory_digest(self, project: str, surface: Optional[str]) -> Optional[dict]:
+        """Return the current digest for (project, surface) as a dict, or None."""
+        row = self.conn.execute(
+            "SELECT * FROM memory_digests WHERE project=? AND surface IS ?",
+            (project, surface)
+        ).fetchone()
+        if not row:
+            return None
+        digest = dict(row)
+        return digest if self._digest_sources_are_eligible(digest) else None
+
+    def _invalidate_memory_digests_for_session_scope(
+        self, project: Optional[str], surface: Optional[str]
+    ) -> None:
+        if project is None:
+            return
+        self.conn.execute(
+            "UPDATE memory_digests SET safety_invalidated=1 "
+            "WHERE project=? AND (surface IS NULL OR surface IS ?)",
+            (project, surface),
+        )
+
+    def update_digest_disabled(self, project: str, surface: Optional[str], disabled: bool) -> None:
+        """Set the disabled flag on a digest to suppress auto-load injection."""
+        self.conn.execute(
+            "UPDATE memory_digests SET disabled=? WHERE project=? AND surface IS ?",
+            (1 if disabled else 0, project, surface)
+        )
+        self.conn.commit()
+
+    def set_session_expiry(self, session_id: str, expires_at: Optional[str]) -> dict:
+        """Set or clear the expires_at field on a session.
+
+        Returns dict with 'ok', 'code', and optionally 'message'.
+        Refuses to set expiry on a pinned (keep_forever=1) session.
+        """
+        row = self.conn.execute(
+            "SELECT keep_forever, project, surface FROM sessions WHERE id=?",
+            (session_id,),
+        ).fetchone()
+        if not row:
+            return {"ok": False, "code": "session_not_found", "message": "Session not found."}
+        if row["keep_forever"]:
+            return {"ok": False, "code": "session_pinned",
+                    "message": "Session is pinned. Unpin before setting expiry."}
+        if expires_at is not None:
+            try:
+                expires_at = normalize_expiry_timestamp(expires_at)
+            except (TypeError, ValueError):
+                return {
+                    "ok": False,
+                    "code": "invalid_expiry",
+                    "message": (
+                        "expires_at must be an ISO 8601 timestamp with a "
+                        "timezone offset"
+                    ),
+                }
+        self.conn.execute(
+            "UPDATE sessions SET expires_at=? WHERE id=?",
+            (expires_at, session_id)
+        )
+        self._invalidate_memory_digests_for_session_scope(
+            row["project"], row["surface"]
+        )
+        self.conn.commit()
+        return {"ok": True}
+
+    def set_session_staleness(self, session_id: str, hint: Optional[str]) -> None:
+        """Set or clear the staleness_hint field on a session."""
+        self.conn.execute(
+            "UPDATE sessions SET staleness_hint=? WHERE id=?",
+            (hint, session_id)
+        )
+        self.conn.commit()
+
+    def get_sessions_for_consolidation(
+        self,
+        project: str,
+        surface: Optional[str],
+        max_sessions: int = 50,
+        exclude_no_llm: bool = False,
+    ) -> List[dict]:
+        """Return up to max_sessions recent sessions for a (project, surface) pair.
+
+        Excludes periodic/file_memory sources. When exclude_no_llm=True, also
+        excludes sessions tagged 'no-llm'.
+        """
+        params: list = [project]
+        sql = (
+            "SELECT id, title, summary, decisions, open_questions, tags, "
+            "start_date, created_at, staleness_hint, expires_at, source "
+            "FROM sessions "
+            "WHERE project=? "
+            "AND (source IS NULL OR source NOT IN ('periodic', 'file_memory'))"
+            " AND (expires_at IS NULL "
+            "OR julianday(expires_at) > julianday('now'))"
+        )
+        if os.environ.get("LORECONVO_EXTERNAL_TOOL_EXCLUSION", "1") != "0":
+            sql += (
+                " AND (external_tool_session IS NULL "
+                "OR external_tool_session = 0)"
+            )
+        if surface is not None:
+            sql += " AND surface=?"
+            params.append(surface)
+        sql += " ORDER BY start_date DESC LIMIT ?"
+        params.append(max_sessions)
+
+        rows = self.conn.execute(sql, params).fetchall()
+        results = [dict(r) for r in rows]
+
+        if exclude_no_llm:
+            filtered = []
+            for r in results:
+                tags = self._parse_json_field(r.get("tags"))
+                if "no-llm" not in tags:
+                    filtered.append(r)
+            results = filtered
+
+        return results
+
+    def count_consolidations_today(
+        self,
+        project: str,
+        surface: Optional[str],
+        log_path: Optional[str] = None,
+    ) -> int:
+        """Count how many consolidation runs occurred today for this (project, surface).
+
+        Reads from consolidation.log (JSON-lines format). Returns 0 if log missing.
+        """
+        if log_path is None:
+            lore_dir = Path(self.config.db_path).parent
+            log_path = str(lore_dir / "consolidation.log")
+
+        if not Path(log_path).is_file():
+            return 0
+
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        count = 0
+        try:
+            for line in Path(log_path).read_text().splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                entry = json.loads(line)
+                ts = entry.get("ts", "")
+                if (
+                    entry.get("project") == project
+                    and entry.get("surface") == surface
+                    and ts.startswith(today)
+                ):
+                    count += 1
+        except Exception:
+            pass
+        return count
+
+    def get_consolidation_log_entries(
+        self,
+        project: Optional[str] = None,
+        surface: Optional[str] = None,
+        limit: int = 10,
+        log_path: Optional[str] = None,
+    ) -> List[dict]:
+        """Return recent consolidation log entries, newest first.
+
+        Filters by project/surface when provided. Reads from consolidation.log.
+        """
+        if log_path is None:
+            lore_dir = Path(self.config.db_path).parent
+            log_path = str(lore_dir / "consolidation.log")
+
+        entries = []
+        if not Path(log_path).is_file():
+            return entries
+
+        try:
+            for line in Path(log_path).read_text().splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                entry = json.loads(line)
+                if project and entry.get("project") != project:
+                    continue
+                if surface and entry.get("surface") != surface:
+                    continue
+                entries.append(entry)
+        except Exception:
+            pass
+
+        entries.reverse()
+        return entries[:limit]
+
+    def get_sessions_for_export(
+        self,
+        project: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+        days_back: Optional[int] = None,
+        limit: int = 1000,
+    ) -> List[Session]:
+        """Return sessions with full detail (including skills) for export."""
+        query = "SELECT * FROM sessions WHERE 1=1"
+        params: list = []
+
+        if days_back is not None:
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=days_back)).isoformat().replace('+00:00', 'Z')
+            query += " AND start_date >= ?"
+            params.append(cutoff)
+
+        if project:
+            query += " AND project = ?"
+            params.append(project)
+
+        query += " ORDER BY start_date DESC LIMIT ?"
+        params.append(limit)
+
+        rows = self.conn.execute(query, params).fetchall()
+        sessions = [self._row_to_session(r) for r in rows]
+
+        if tags:
+            sessions = [s for s in sessions if any(t in s.tags for t in tags)]
+
+        for session in sessions:
+            skill_rows = self.conn.execute(
+                "SELECT skill_name FROM session_skills WHERE session_id = ? "
+                "ORDER BY position, skill_name",
+                (session.id,)
+            ).fetchall()
+            session.skills_used = [r["skill_name"] for r in skill_rows]
+
+        return sessions
+
+    def import_session(
+        self,
+        session: Session,
+        replace: bool = False,
+        fields_present: Optional[set[str]] = None,
+    ) -> str:
+        """Import one session. Returns 'imported', 'replaced', or 'skipped'."""
+        existing = self.conn.execute(
+            "SELECT * FROM sessions WHERE id = ?", (session.id,)
+        ).fetchone()
+
+        if existing and not replace:
+            return "skipped"
+
+        if not existing:
+            if not self.config.is_pro:
+                current_count = self.session_count()
+                if current_count >= self.config.max_free_sessions:
+                    raise SessionLimitReachedError(
+                        f"Free tier limit reached: {current_count} of "
+                        f"{self.config.max_free_sessions} sessions stored. "
+                        f"Upgrade at {LORECONVO_UPGRADE_URL} to unlock unlimited "
+                        "sessions, then set your LORECONVO_PRO license key."
+                    )
+
+        content_hash = (
+            session.content_hash
+            or self.compute_content_hash(session.title, session.summary, session.created_at)
+        )
+        origin_machine = session.origin_machine or self._get_origin_machine()
+        present = fields_present
+        if present is None:
+            present = {
+                "source", "shared_by", "origin_machine", "content_hash",
+                "external_tool_session", "reasoning_notes", "previous_summary",
+                "expires_at", "staleness_hint", "keep_forever",
+            }
+        expires_at = None if session.keep_forever else session.expires_at
+        self.conn.execute(
+            """INSERT INTO sessions
+               (id, title, surface, project, start_date, end_date, summary,
+                decisions, artifacts, open_questions, tags, created_at, source,
+                shared_by, origin_machine, content_hash, external_tool_session,
+                reasoning_notes, previous_summary, expires_at, staleness_hint,
+                keep_forever)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET
+               title = excluded.title,
+               surface = excluded.surface,
+               project = excluded.project,
+               start_date = excluded.start_date,
+               end_date = excluded.end_date,
+               summary = excluded.summary,
+               decisions = excluded.decisions,
+               artifacts = excluded.artifacts,
+               open_questions = excluded.open_questions,
+               tags = excluded.tags,
+               source = CASE WHEN ? THEN excluded.source ELSE sessions.source END,
+               shared_by = CASE WHEN ? THEN excluded.shared_by ELSE sessions.shared_by END,
+               origin_machine = CASE WHEN ? THEN excluded.origin_machine ELSE sessions.origin_machine END,
+               content_hash = CASE WHEN ? THEN excluded.content_hash ELSE sessions.content_hash END,
+               external_tool_session = CASE WHEN ? THEN excluded.external_tool_session ELSE sessions.external_tool_session END,
+               reasoning_notes = CASE WHEN ? THEN excluded.reasoning_notes ELSE sessions.reasoning_notes END,
+               previous_summary = CASE
+                   WHEN sessions.summary IS NOT excluded.summary THEN sessions.summary
+                   WHEN ? THEN excluded.previous_summary
+                   ELSE sessions.previous_summary
+               END,
+               expires_at = CASE
+                   WHEN (CASE WHEN ? THEN excluded.keep_forever ELSE sessions.keep_forever END) = 1 THEN NULL
+                   WHEN ? THEN excluded.expires_at
+                   ELSE sessions.expires_at
+               END,
+               staleness_hint = CASE WHEN ? THEN excluded.staleness_hint ELSE sessions.staleness_hint END,
+               keep_forever = CASE WHEN ? THEN excluded.keep_forever ELSE sessions.keep_forever END""",
+            (
+                session.id, session.title, session.surface, session.project,
+                session.start_date, session.end_date, session.summary,
+                json.dumps(session.decisions), json.dumps(session.artifacts),
+                json.dumps(session.open_questions), json.dumps(session.tags),
+                session.created_at, session.source,
+                session.shared_by, origin_machine, content_hash,
+                1 if session.external_tool_session else 0,
+                session.reasoning_notes, session.previous_summary,
+                expires_at, session.staleness_hint,
+                1 if session.keep_forever else 0,
+                "source" in present,
+                "shared_by" in present,
+                "origin_machine" in present,
+                "content_hash" in present,
+                "external_tool_session" in present,
+                "reasoning_notes" in present,
+                "previous_summary" in present,
+                "keep_forever" in present,
+                "expires_at" in present,
+                "staleness_hint" in present,
+                "keep_forever" in present,
+            )
+        )
+        if existing:
+            invalidating_change = (
+                existing["summary"] != session.summary
+                or existing["project"] != session.project
+                or existing["surface"] != session.surface
+                or (
+                    "source" in present
+                    and existing["source"] != session.source
+                )
+                or (
+                    "external_tool_session" in present
+                    and bool(existing["external_tool_session"])
+                    != session.external_tool_session
+                )
+                or "expires_at" in present
+            )
+            if invalidating_change:
+                self._invalidate_memory_digests_for_session_scope(
+                    existing["project"], existing["surface"]
+                )
+                self._invalidate_memory_digests_for_session_scope(
+                    session.project, session.surface
+                )
+        if existing:
+            self.conn.execute(
+                "DELETE FROM session_skills WHERE session_id = ?", (session.id,)
+            )
+        if session.skills_used:
+            for position, skill_name in enumerate(session.skills_used):
+                self.conn.execute(
+                    """INSERT OR REPLACE INTO session_skills
+                       (session_id, skill_name, invocation_count, position)
+                       VALUES (?, ?, 1, ?)""",
+                    (session.id, skill_name, position)
+                )
+        self.conn.commit()
+        return "replaced" if existing else "imported"
+
+    # -- Portable export / import payloads (shared core, SH-101928) --
+
+    @staticmethod
+    def _session_export_dict(session: Session) -> dict:
+        """Serialize one session for a portable export (format 1.1).
+
+        Moved out of server.py so the fallback script and loreconvo-cli are
+        second callers of the same serialization -- never a second
+        implementation. Field set mirrors the MCP export_sessions tool
+        exactly.
+        """
+        return {
+            "export_version": "1.1",
+            "id": session.id,
+            "title": session.title,
+            "surface": session.surface,
+            "project": session.project,
+            "start_date": session.start_date,
+            "end_date": session.end_date,
+            "summary": session.summary,
+            "decisions": session.decisions,
+            "artifacts": session.artifacts,
+            "open_questions": session.open_questions,
+            "tags": session.tags,
+            "skills_used": session.skills_used,
+            "created_at": session.created_at,
+            "source": session.source,
+            "shared_by": session.shared_by,
+            "origin_machine": session.origin_machine,
+            "content_hash": session.content_hash,
+            "external_tool_session": session.external_tool_session,
+            "reasoning_notes": session.reasoning_notes,
+            "previous_summary": session.previous_summary,
+            "expires_at": session.expires_at,
+            "staleness_hint": session.staleness_hint,
+            "keep_forever": session.keep_forever,
+        }
+
+    def export_payload(
+        self,
+        project: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+        days_back: Optional[int] = None,
+        limit: int = 1000,
+        fmt: str = "json",
+    ) -> dict:
+        """Build the portable export payload for the export_sessions tool.
+
+        Shared core version of server.py's export_sessions serialization.
+        Returns {"format": str, "data": str, "session_count": int}; callers
+        with an output path write the file themselves. Format must be 'json'
+        (loreconvo_export envelope) or 'jsonl' (one session per line).
+        """
+        sessions = self.get_sessions_for_export(
+            project=project, tags=tags, days_back=days_back, limit=limit
+        )
+        session_dicts = [self._session_export_dict(s) for s in sessions]
+        if fmt == "jsonl":
+            data_str = "\n".join(json.dumps(d) for d in session_dicts)
+        else:
+            export_obj = {
+                "loreconvo_export": {
+                    "version": "1.1",
+                    "session_count": len(session_dicts),
+                    "filters": {
+                        "project": project,
+                        "tags": tags,
+                        "days_back": days_back,
+                    },
+                    "sessions": session_dicts,
+                }
+            }
+            data_str = json.dumps(export_obj, indent=2)
+        return {
+            "format": fmt,
+            "session_count": len(sessions),
+            "data": data_str,
+        }
+
+    def import_export_file(
+        self,
+        file_path: str,
+        on_conflict: str = "skip",
+        dry_run: bool = False,
+    ) -> dict:
+        """Import sessions from an export file (JSON or JSONL).
+
+        Shared core version of server.py's import_sessions: parsing,
+        validation, field caps, and the import loop. server.py delegates to
+        this so the fallback script and CLI are second callers, not second
+        implementations.
+        """
+        if on_conflict not in ("skip", "replace"):
+            return {"error": "on_conflict must be 'skip' or 'replace'"}
+
+        path = Path(file_path)
+        if not path.exists():
+            return {"error": f"File not found: {file_path}"}
+
+        if path.stat().st_size > _MAX_IMPORT_BYTES:
+            return {"error": "Import file too large. Max: 50 MB."}
+
+        raw = path.read_text(encoding="utf-8").strip()
+
+        raw_sessions: list = []
+        try:
+            wrapper = json.loads(raw)
+            if "loreconvo_export" in wrapper:
+                raw_sessions = wrapper["loreconvo_export"]["sessions"]
+            elif isinstance(wrapper, dict) and ("id" in wrapper or "title" in wrapper):
+                raw_sessions = [wrapper]
+            else:
+                return {"error": "Invalid export file: missing 'loreconvo_export' key"}
+        except json.JSONDecodeError:
+            for line_num, line in enumerate(raw.splitlines(), 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    raw_sessions.append(json.loads(line))
+                except json.JSONDecodeError as exc:
+                    return {"error": f"Invalid JSON on line {line_num}: {exc}"}
+
+        if len(raw_sessions) > _MAX_SESSIONS_PER_FILE:
+            return {"error": "Import file contains too many sessions. Max: 10,000."}
+
+        imported = 0
+        replaced = 0
+        skipped = 0
+        limit_hit = False
+
+        for raw_s in raw_sessions:
+            for bool_field in ("external_tool_session", "keep_forever"):
+                if bool_field in raw_s and not isinstance(raw_s[bool_field], bool):
+                    return {"error": f"{bool_field} must be a boolean"}
+            expires_at = raw_s.get("expires_at")
+            if expires_at is not None:
+                if not isinstance(expires_at, str):
+                    return {"error": "expires_at must be an ISO 8601 timestamp or null"}
+                try:
+                    expires_at = normalize_expiry_timestamp(expires_at)
+                except ValueError as exc:
+                    return {"error": str(exc)}
+            if (
+                "source" in raw_s
+                and raw_s["source"] is not None
+                and not isinstance(raw_s["source"], str)
+            ):
+                return {"error": "source must be a string or null"}
+            title = str(raw_s.get("title", "") or "")[:_IMPORT_FIELD_CAPS["title"]]
+            summary = str(raw_s.get("summary", "") or "")[:_IMPORT_FIELD_CAPS["summary"]]
+            decisions = [str(d)[:_IMPORT_FIELD_CAPS["list_item"]] for d in (raw_s.get("decisions") or [])]
+            open_questions = [str(q)[:_IMPORT_FIELD_CAPS["list_item"]] for q in (raw_s.get("open_questions") or [])]
+            tags = [str(t)[:_IMPORT_FIELD_CAPS["list_item"]] for t in (raw_s.get("tags") or [])]
+            artifacts = [Path(str(a)).name for a in (raw_s.get("artifacts") or [])]
+            skills_used = [str(s)[:_IMPORT_FIELD_CAPS["list_item"]] for s in (raw_s.get("skills_used") or [])]
+            session = Session(
+                id=raw_s.get("id", ""),
+                title=title,
+                surface=raw_s.get("surface", ""),
+                project=raw_s.get("project"),
+                start_date=raw_s.get("start_date", ""),
+                end_date=raw_s.get("end_date"),
+                summary=summary,
+                decisions=decisions,
+                artifacts=artifacts,
+                open_questions=open_questions,
+                tags=tags,
+                skills_used=skills_used,
+                created_at=raw_s.get("created_at", ""),
+                source=raw_s.get("source", "session"),
+                shared_by=raw_s.get("shared_by"),
+                origin_machine=raw_s.get("origin_machine"),
+                content_hash=raw_s.get("content_hash"),
+                external_tool_session=raw_s.get("external_tool_session", False),
+                reasoning_notes=raw_s.get("reasoning_notes"),
+                previous_summary=raw_s.get("previous_summary"),
+                keep_forever=raw_s.get("keep_forever", False),
+                expires_at=expires_at,
+                staleness_hint=raw_s.get("staleness_hint"),
+            )
+            if session.keep_forever:
+                session.expires_at = None
+            if not session.id:
+                skipped += 1
+                continue
+
+            if dry_run:
+                if self.session_exists(session.id):
+                    if on_conflict == "replace":
+                        replaced += 1
+                    else:
+                        skipped += 1
+                else:
+                    imported += 1
+                continue
+
+            try:
+                result = self.import_session(
+                    session,
+                    replace=(on_conflict == "replace"),
+                    fields_present=set(raw_s),
+                )
+            except SessionLimitReachedError:
+                limit_hit = True
+                break
+
+            if result == "imported":
+                imported += 1
+            elif result == "replaced":
+                replaced += 1
+            else:
+                skipped += 1
+
+        summary = {
+            "status": "dry_run" if dry_run else "done",
+            "total_in_file": len(raw_sessions),
+            "imported": imported,
+            "replaced": replaced,
+            "skipped": skipped,
+        }
+        if dry_run:
+            summary["note"] = (
+                f"Dry run preview: {imported} would-import, {replaced} would-replace, "
+                f"{skipped} would-skip. No changes made."
+            )
+        if limit_hit:
+            summary["warning"] = (
+                "Free tier limit reached. Some sessions were not imported. "
+                "Upgrade to Pro for unlimited sessions."
+            )
+            summary["upgrade_url"] = LORECONVO_UPGRADE_URL
+        return summary
+
+    def anthropic_export_payload(
+        self,
+        project: Optional[str] = None,
+        session_ids: Optional[List[str]] = None,
+        days_back: Optional[int] = None,
+    ) -> dict:
+        """Build the anthropic-memory-v1 export payload for export_for_anthropic.
+
+        Shared core version of server.py's export_for_anthropic
+        serialization (excluding the output_path handling, which stays with
+        the callers). Returns {"error": str} on the free tier; otherwise
+        {"data": str, "entry_count": int}.
+        """
+        status = get_license_status()
+        if not status["is_pro"]:
+            return {
+                "error": (
+                    "Export to Anthropic format requires LoreConvo Pro. "
+                    f"Get a license by upgrading at {LORECONVO_UPGRADE_URL}."
+                )
+            }
+
+        sessions = self.get_sessions_for_shared_export(
+            project=project,
+            session_id_filter=session_ids,
+            export_all=(session_ids is None and project is None),
+        )
+
+        if days_back is not None:
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=days_back)).isoformat().replace('+00:00', 'Z')
+            sessions = [s for s in sessions if s.start_date >= cutoff]
+
+        entries = []
+        for s in sessions:
+            entries.append({
+                "id": s.id,
+                "content": s.summary or "",
+                "created_at": s.created_at,
+                "tags": s.tags or [],
+                "metadata": {
+                    "title": s.title,
+                    "surface": s.surface,
+                    "project": s.project,
+                },
+            })
+
+        export_obj = {
+            "format": "anthropic-memory-v1",
+            "source": "loreconvo",
+            "exported_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "schema_note": (
+                "Preliminary field mapping -- validate against Anthropic beta API "
+                "docs before submitting to Anthropic memory stores."
+            ),
+            "entry_count": len(entries),
+            "entries": entries,
+        }
+        return {
+            "entry_count": len(entries),
+            "data": json.dumps(export_obj, indent=2),
+        }
+
+    # -- Observability shared core (SH-101927) --
+
+    def usage_stats_with_hook_status(self) -> dict:
+        """Return the get_stats payload: usage stats plus hook-failure status.
+
+        Shared core version of server.py's get_stats assembly. The
+        hook_saves_failing flag is the one piece the MCP tool derived from a
+        sidecar file -- folded in here so fallback and CLI report the same
+        value from the same data_dir.
+        """
+        result = self.get_usage_stats()
+        data_dir = Path(self.config.db_path).parent
+        breadcrumb_path = data_dir / "hook_failure.json"
+        result["hook_saves_failing"] = breadcrumb_path.exists()
+        return result
+
+    def get_dream_log_entries(
+        self,
+        project: Optional[str] = None,
+        surface: Optional[str] = None,
+        limit: int = 10,
+    ) -> tuple:
+        """Return consolidation log entries with the digest status the MCP
+        get_dream_log tool attaches (digest_status)."""
+        lore_dir = Path(self.config.db_path).parent
+        log_path = str(lore_dir / "consolidation.log")
+        entries = self.get_consolidation_log_entries(
+            project=project,
+            surface=surface,
+            limit=limit,
+            log_path=log_path,
+        )
+        digest = None
+        if project:
+            raw = self.get_memory_digest(project, surface)
+            if raw:
+                inject_env = os.environ.get("LORECONVO_DREAM_INJECT", "true").lower()
+                inject_active = inject_env != "false" and not bool(raw.get("disabled", 0))
+                digest = {
+                    "updated_at": raw.get("updated_at", ""),
+                    "mode": raw.get("mode", "heuristic"),
+                    "source_count": raw.get("source_count", 0),
+                    "disabled": bool(raw.get("disabled", 0)),
+                    "api_key_found": bool(raw.get("api_key_found", 1)),
+                    "injection_active": inject_active,
+                    "injection_reason": (
+                        "active" if inject_active
+                        else ("LORECONVO_DREAM_INJECT=false" if inject_env == "false"
+                              else "digest.disabled=1 -- manually suppressed")
+                    ),
+                }
+        return entries, digest
+
+    def build_graph_map_payload(
+        self,
+        session_id: Optional[str] = None,
+        project: Optional[str] = None,
+        depth: int = 1,
+        max_nodes: int = 60,
+    ) -> dict:
+        """Traverse the graph neighborhood and assemble the graph_session_map
+        response payload via core.graph.build_session_map_payload.
+
+        Shared core version of the MCP tool body (SH-101927). The traversal
+        itself lives in get_graph_neighborhood(); core.graph stays the single
+        import site per the KG tool proposal's import-site constraint (the
+        database module imports it here; server.py imports the module for
+        its own module-level reference, which it already does).
+        """
+        if bool(session_id) == bool(project):
+            return {"error": {
+                "code": "SEED_XOR", "field": None,
+                "message": "Exactly one of session_id or project is required.",
+            }}
+        try:
+            depth = int(depth)
+        except (TypeError, ValueError):
+            return {"error": {
+                "code": "INVALID_PARAM", "field": "depth",
+                "message": "depth must be an integer.",
+            }}
+        try:
+            max_nodes = int(max_nodes)
+        except (TypeError, ValueError):
+            return {"error": {
+                "code": "INVALID_PARAM", "field": "max_nodes",
+                "message": "max_nodes must be an integer.",
+            }}
+
+        neighborhood = self.get_graph_neighborhood(
+            seed_session_id=session_id,
+            seed_project=project,
+            depth=depth,
+            max_nodes=max_nodes,
+        )
+        if "error" in neighborhood:
+            return {"error": {
+                "code": "GRAPH_DB_UNAVAILABLE", "field": None,
+                "message": neighborhood["message"],
+            }}
+
+        from .graph import build_session_map_payload
+
+        return build_session_map_payload(
+            neighborhood,
+            seed_kind="session" if session_id else "project",
+            seed_value=str(session_id or project or ""),
+        )
+
+    # -- Memory items: structured decisions/questions/artifacts (SH-12768) --
+
+    def save_memory_item(
+        self, item_type: str, title: str, body: Optional[str] = None,
+        session_id: Optional[str] = None, project: str = "unspecified",
+        tags: Optional[list] = None, metadata: Optional[dict] = None,
+        external_id: Optional[str] = None, artifact_type: Optional[str] = None,
+    ) -> dict:
+        """Save a decision, open_question, or artifact as a memory_items row.
+
+        Idempotent when external_id is given: a second save with the same
+        (project, external_id) returns the existing row (created=False)
+        instead of raising on the UNIQUE constraint. [r4 interfaces]
+
+        id is always server-generated (uuid4) -- callers cannot supply one,
+        preventing collision/replay/confusion. [r4 "ID generation (mandatory)"]
+        """
+        if item_type not in _MEMORY_ITEM_TYPES:
+            return {
+                "ok": False, "code": "invalid_item_type",
+                "message": "item_type must be one of {}.".format(_MEMORY_ITEM_TYPES),
+            }
+        if not self._memory_items_available:
+            return {
+                "ok": False, "code": "memory_items_unavailable",
+                "message": "Structured memory items require SQLite >= 3.38.0 "
+                           "(json1); unavailable on this installation.",
+            }
+        if not title or not title.strip():
+            return {"ok": False, "code": "invalid_title", "message": "title is required and must be non-empty."}
+
+        # Mutable default argument fix: None in, fresh list/dict per call. [r4 mandatory]
+        tags = list(tags) if tags else []
+        metadata = dict(metadata) if metadata else {}
+
+        err = _validate_memory_session_id(self.conn, session_id)
+        if err is not None:
+            return err
+
+        title, title_truncated = _truncate_text(title)
+        stored_body = artifact_type if item_type == "artifact" else body
+        stored_body, body_truncated = _truncate_text(stored_body)
+        tags_json, tags_truncated = _truncate_json_list(tags)
+        metadata_json, metadata_truncated = _truncate_json_dict(metadata)
+        truncated = title_truncated or body_truncated or tags_truncated or metadata_truncated
+
+        item_id = str(uuid.uuid4())
+        status = _MEMORY_ITEM_INITIAL_STATUS[item_type]
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        with self._write_context() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    """INSERT OR IGNORE INTO memory_items
+                       (id, item_type, session_id, project, tags, metadata, title,
+                        body, status, external_id, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (item_id, item_type, session_id, project, tags_json, metadata_json,
+                     title, stored_body, status, external_id, now, now)
+                )
+                changes = conn.execute("SELECT changes()").fetchone()[0]
+                if changes == 0 and external_id is not None:
+                    existing = conn.execute(
+                        "SELECT id, status FROM memory_items WHERE project=? AND external_id=?",
+                        (project, external_id)
+                    ).fetchone()
+                    conn.execute("COMMIT")
+                    if existing is None:
+                        return {
+                            "ok": False, "code": "insert_failed",
+                            "message": "Could not save memory item.",
+                        }
+                    return {
+                        "ok": True, "id": existing["id"], "status": existing["status"],
+                        "created": False,
+                    }
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+        return {"ok": True, "id": item_id, "status": status, "created": True, "truncated": truncated}
+
+    def query_memory_items(
+        self, item_type: Optional[str] = None, project: Optional[str] = None,
+        status: Optional[str] = None, artifact_type: Optional[str] = None,
+        days: Optional[int] = None, limit: int = 50,
+    ) -> dict:
+        """Query memory_items by type, project, status, artifact_type, and recency.
+
+        Date comparison uses lexicographic ISO 8601 UTC string comparison
+        (correct for fixed-width zero-padded timestamps); a defensive LIKE
+        filter excludes malformed created_at rows from the days window.
+        """
+        if not self._memory_items_available:
+            return {
+                "ok": False, "code": "memory_items_unavailable",
+                "message": "Structured memory items require SQLite >= 3.38.0 "
+                           "(json1); unavailable on this installation.",
+            }
+        if item_type is not None and item_type not in _MEMORY_ITEM_TYPES:
+            return {
+                "ok": False, "code": "invalid_item_type",
+                "message": "item_type must be one of {}.".format(_MEMORY_ITEM_TYPES),
+            }
+
+        limit = max(1, min(int(limit), 200))
+        clauses = []
+        params = []
+        if item_type is not None:
+            clauses.append("item_type = ?")
+            params.append(item_type)
+        if project is not None:
+            clauses.append("project = ?")
+            params.append(project)
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
+        if artifact_type is not None:
+            clauses.append("item_type = 'artifact' AND body = ?")
+            params.append(artifact_type)
+        if days is not None:
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=int(days))).strftime("%Y-%m-%dT%H:%M:%SZ")
+            clauses.append("created_at >= ?")
+            params.append(cutoff)
+            clauses.append("created_at LIKE '____-__-__T__:__:__Z'")
+
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        rows = self.conn.execute(
+            "SELECT * FROM memory_items {} ORDER BY created_at DESC LIMIT ?".format(where),
+            (*params, limit)
+        ).fetchall()
+
+        items = []
+        for r in rows:
+            item = dict(r)
+            item["tags"] = json.loads(item["tags"]) if item.get("tags") else []
+            item["metadata"] = json.loads(item["metadata"]) if item.get("metadata") else {}
+            items.append(item)
+
+        return {"ok": True, "items": items, "count": len(items)}
+
+    def transition_memory_item(
+        self, item_id: str, transition: str, reason: Optional[str] = None,
+        closing_session_id: Optional[str] = None,
+    ) -> dict:
+        """Move a memory item through its lifecycle.
+
+        Validates the (item_type, transition) pair server-side before any
+        write -- invalid transitions return code='invalid_transition' rather
+        than a stringly-typed silent failure. [r4 interfaces HIGH #3]
+        Already-closed items return code='already_closed' so callers can
+        retry idempotently. [r4 "transition_memory_item"]
+        """
+        if not self._memory_items_available:
+            return {
+                "ok": False, "code": "memory_items_unavailable",
+                "message": "Structured memory items require SQLite >= 3.38.0 "
+                           "(json1); unavailable on this installation.",
+            }
+        err = _validate_memory_session_id(self.conn, closing_session_id)
+        if err is not None:
+            return err
+
+        new_status = None
+        with self._write_context() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT item_type, status FROM memory_items WHERE id = ?", (item_id,)
+                ).fetchone()
+                if row is None:
+                    conn.execute("ROLLBACK")
+                    return {"ok": False, "code": "not_found", "message": "No memory item with the given id."}
+
+                item_type, current_status = row["item_type"], row["status"]
+                if current_status in _MEMORY_ITEM_TERMINAL_STATUSES.get(item_type, set()):
+                    conn.execute("ROLLBACK")
+                    return {
+                        "ok": False, "code": "already_closed",
+                        "message": "This item is already in a terminal state.",
+                    }
+
+                new_status = _MEMORY_ITEM_TRANSITIONS.get((item_type, transition))
+                if new_status is None:
+                    conn.execute("ROLLBACK")
+                    return {
+                        "ok": False, "code": "invalid_transition",
+                        "message": "The requested transition is not valid for this item's type.",
+                    }
+
+                now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                conn.execute(
+                    """UPDATE memory_items SET status=?, closed_at=?, closed_reason=?,
+                       closed_by_session_id=?, updated_at=? WHERE id=?""",
+                    (new_status, now, reason, closing_session_id, now, item_id)
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+        return {"ok": True, "id": item_id, "status": new_status}
+
+    def update_memory_item(
+        self, item_id: str, title: Optional[str] = None, body: Optional[str] = None,
+        tags: Optional[list] = None, metadata: Optional[dict] = None,
+        new_project: Optional[str] = None, allow_project_change: bool = False,
+    ) -> dict:
+        """Correct a memory item's fields, or move it between projects.
+
+        Moving projects requires allow_project_change=True as an explicit
+        guard against accidental cross-project moves. The external_id
+        conflict check and the UPDATE are in one transaction. [r4 interfaces
+        "Cross-project move atomicity"] The conflict error omits identifiers
+        (project name, external_id, conflicting item id) so callers must
+        issue a targeted query to resolve rather than leaking them into MCP
+        error text. [r4 interfaces HIGH #6]
+        """
+        if not self._memory_items_available:
+            return {
+                "ok": False, "code": "memory_items_unavailable",
+                "message": "Structured memory items require SQLite >= 3.38.0 "
+                           "(json1); unavailable on this installation.",
+            }
+
+        truncated = False
+        with self._write_context() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute("SELECT * FROM memory_items WHERE id = ?", (item_id,)).fetchone()
+                if row is None:
+                    conn.execute("ROLLBACK")
+                    return {"ok": False, "code": "not_found", "message": "No memory item with the given id."}
+
+                if new_project and allow_project_change and row["external_id"] is not None:
+                    conflict = conn.execute(
+                        "SELECT 1 FROM memory_items WHERE project=? AND external_id=? AND id!=?",
+                        (new_project, row["external_id"], item_id)
+                    ).fetchone()
+                    if conflict is not None:
+                        conn.execute("ROLLBACK")
+                        return {
+                            "ok": False,
+                            "code": "external_id_conflict",
+                            "message": "The requested external_id is already used by another item "
+                                       "in the destination project. Query destination project items to resolve.",
+                        }
+
+                set_clauses = []
+                params = []
+                if title is not None:
+                    if not title.strip():
+                        conn.execute("ROLLBACK")
+                        return {"ok": False, "code": "invalid_title", "message": "title must be non-empty."}
+                    set_clauses.append("title = ?")
+                    params.append(title)
+                if body is not None:
+                    new_body, body_truncated = _truncate_text(body)
+                    truncated = truncated or body_truncated
+                    set_clauses.append("body = ?")
+                    params.append(new_body)
+                if tags is not None:
+                    tags_json, tags_truncated = _truncate_json_list(list(tags))
+                    truncated = truncated or tags_truncated
+                    set_clauses.append("tags = ?")
+                    params.append(tags_json)
+                if metadata is not None:
+                    metadata_json, metadata_truncated = _truncate_json_dict(dict(metadata))
+                    truncated = truncated or metadata_truncated
+                    set_clauses.append("metadata = ?")
+                    params.append(metadata_json)
+                if new_project and allow_project_change:
+                    set_clauses.append("project = ?")
+                    params.append(new_project)
+
+                if not set_clauses:
+                    if new_project and not allow_project_change:
+                        conn.execute("ROLLBACK")
+                        return {"ok": True, "message": "Project change blocked by missing --allow-project-change flag (no-op)."}
+                    conn.execute("ROLLBACK")
+                    return {"ok": False, "code": "no_fields_to_update", "message": "No updatable fields were provided."}
+
+                now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                set_clauses.append("updated_at = ?")
+                params.append(now)
+                params.append(item_id)
+
+                conn.execute(
+                    "UPDATE memory_items SET {} WHERE id = ?".format(", ".join(set_clauses)),
+                    params
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+        return {"ok": True, "id": item_id, "truncated": truncated}
+
+    def verify_memory_items_fts_integrity(self) -> dict:
+        """Check memory_items_fts consistency via the FTS5 built-in integrity-check.
+
+        Uses the FTS5 built-in mechanism rather than a custom rowid NOT IN
+        scan (O(n^2)). [r4 ops-cost HIGH #13]
+        """
+        if not self._memory_items_fts_available:
+            return {"ok": True, "error": None, "note": "memory_items FTS is not enabled on this installation."}
+        try:
+            self.conn.execute(
+                "INSERT INTO memory_items_fts(memory_items_fts) VALUES('integrity-check')"
+            )
+            return {"ok": True, "error": None}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def _check_memory_items_fts_rebuild_disk_space(self) -> None:
+        """Raise RuntimeError if free disk space is under 2x the DB file size.
+
+        The 2x estimate is conservative: FTS5 rebuild rewrites the index file,
+        which temporarily needs space for both the old and new copies. [r4
+        ops-cost HIGH #13]
+        """
+        db_path = Path(self.config.db_path)
+        if not db_path.exists():
+            return
+        db_size = db_path.stat().st_size
+        available = shutil.disk_usage(db_path.parent).free
+        if available < db_size * 2:
+            raise RuntimeError(
+                "Insufficient disk space for FTS rebuild: need ~{}MB free, have {}MB.".format(
+                    db_size * 2 // (1024 * 1024), available // (1024 * 1024)
+                )
+            )
+
+    def rebuild_memory_items_fts_index(self) -> dict:
+        """Verify memory_items_fts integrity, check disk space, then rebuild if needed.
+
+        Circuit-breaker: if verify still fails post-rebuild (e.g. the
+        application bug causing corruption is still present), this returns
+        an error instead of looping. [r4 ops-cost HIGH: "FTS rebuild loop
+        when application bug causes corruption"]
+        """
+        if not self._memory_items_fts_available:
+            return {"ok": False, "code": "fts_unavailable", "message": "memory_items FTS is not enabled on this installation."}
+        integrity = self.verify_memory_items_fts_integrity()
+        if integrity["ok"]:
+            return {"ok": True, "message": "memory_items FTS index is consistent; no rebuild needed."}
+        try:
+            self._check_memory_items_fts_rebuild_disk_space()
+        except RuntimeError as exc:
+            return {"ok": False, "code": "insufficient_disk", "message": str(exc)}
+        try:
+            self.conn.execute("INSERT INTO memory_items_fts(memory_items_fts) VALUES('rebuild')")
+        except Exception as exc:
+            return {"ok": False, "code": "rebuild_failed", "message": str(exc)}
+        post = self.verify_memory_items_fts_integrity()
+        if not post["ok"]:
+            return {
+                "ok": False, "code": "post_rebuild_inconsistent",
+                "message": "FTS index still inconsistent after rebuild: " + (post["error"] or ""),
+            }
+        return {"ok": True, "message": "memory_items FTS index rebuilt successfully."}

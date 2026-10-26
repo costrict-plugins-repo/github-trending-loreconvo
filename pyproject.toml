@@ -1,0 +1,99 @@
+[project]
+name = "loreconvo"
+version = "0.10.19"
+description = "Cross-surface persistent memory for Claude sessions. Vault conversations from Code, Cowork, and Chat -- recall decisions, artifacts, and context in any future session."
+readme = "README.md"
+license = "BUSL-1.1"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [
+    { name = "Labyrinth Analytics Consulting" }
+]
+keywords = ["mcp", "claude", "memory", "sessions", "cross-surface", "ai-tools", "claude-plugin"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: End Users/Desktop",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Communications",
+]
+
+dependencies = [
+    # Bounded ranges for deps shared with Hermes core (SH-104370).
+    # The Hermes memory provider installs loreconvo INTO Hermes's env, so
+    # exact pins on these packages break the catalog install every time
+    # Hermes bumps one. Floor = current tested pin; ceiling = next major.
+    # Per-dep `# allow-range` bypasses safe_git Step 0e for these only.
+    # Non-shared deps stay exact-pinned per the repo-wide rule.
+    "click>=8.4.2,<9",  # allow-range: click SH-104370
+    "cryptography>=50.0.1,<51",  # allow-range: cryptography SH-104370
+    "packaging>=26.0,<27",  # allow-range: packaging SH-104370
+    # Semantic search moved from the [pro] extra to base on 2026-07-25
+    # (spec amendment A1). fastembed runs BAAI/bge-small-en-v1.5 on
+    # onnxruntime instead of torch: same 384-dim vectors, ~130MB instead
+    # of ~300MB, one install path for every tier. Pro is a license flag.
+    "lancedb==0.34.0",
+    "pyarrow==24.0.0",
+    "fastembed==0.8.0",
+    # fastembed 0.8.0 caps onnxruntime <1.24 on Python <=3.13 but requires
+    # >=1.24.2 on 3.14, so no single pin covers requires-python >=3.10.
+    # Exact-pinned per marker rather than ranged (repo rule).
+    "onnxruntime==1.23.2; python_version < '3.14'",
+    "onnxruntime==1.28.0; python_version >= '3.14'",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.0.3",
+    "pytest-asyncio==1.4.0",
+]
+pro = [
+    # semantic deps moved to base 2026-07-25 (spec amendment A1); kept so
+    # [pro] installs don't break
+]
+server = [
+    # MCP server stack -- separated from core so the Hermes memory provider
+    # can install the lean core without pulling in mcp (which conflicts with
+    # Hermes's mcp==2.0.0 pin).
+    "mcp[cli]==1.30.0",
+    "starlette==1.3.1",
+]
+bridge = [
+    "anthropic==0.87.0",
+]
+
+[project.scripts]
+loreconvo = "loreconvo.server:main"
+loreconvo-compat-check = "loreconvo.compat_check:main"
+loreconvo-capture = "loreconvo.hooks.scripts.post_turn_capture:main"
+loreconvo-capture-worker = "loreconvo.hooks.scripts.capture_worker:main"
+
+[project.urls]
+Homepage = "https://github.com/labyrinth-analytics/loreconvo"
+Repository = "https://github.com/labyrinth-analytics/loreconvo"
+"Bug Tracker" = "https://github.com/labyrinth-analytics/loreconvo/issues"
+
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+# src/ IS the loreconvo package (flat structure: src/server.py, src/core/, etc.)
+# This maps `loreconvo` -> src/ so that `loreconvo.server:main` resolves correctly.
+[tool.setuptools]
+packages = [
+    "loreconvo",
+    "loreconvo.core",
+    "loreconvo.hooks",
+    "loreconvo.hooks.scripts",
+]
+
+[tool.setuptools.package-dir]
+"loreconvo" = "src"
+"loreconvo.core" = "src/core"
+"loreconvo.hooks" = "hooks"
+"loreconvo.hooks.scripts" = "hooks/scripts"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

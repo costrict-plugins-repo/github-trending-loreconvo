@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "loreconvo": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "loreconvo[server]==0.10.19",
+        "loreconvo"
+      ],
+      "env": {
+        "LORECONVO_PRO": ""
+      }
+    }
+  }
+}

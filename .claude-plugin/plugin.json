@@ -1,0 +1,74 @@
+{
+  "name": "loreconvo",
+  "displayName": "LoreConvo",
+  "version": "0.10.19",
+  "description": "Vault your Claude conversations. Captures session decisions, artifacts, and context across Code, Cowork, and Chat. Organizes memory by project, skill, and persona. Never re-explain yourself again.",
+  "main": "src/server.py",
+  "icon": "assets/icon.svg",
+  "author": {
+    "name": "Labyrinth Analytics Consulting",
+    "url": "https://labyrinthanalyticsconsulting.com"
+  },
+  "keywords": [
+    "memory",
+    "session",
+    "context",
+    "vault",
+    "conversations",
+    "persistence",
+    "recall"
+  ],
+  "license": "BSL-1.1",
+  "privacy_policies": [
+    "https://labyrinthanalyticsconsulting.com/privacy"
+  ],
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/setup.sh\""
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/on_session_start.sh\""
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/on_stop.sh\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/on_post_turn_capture.sh\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/on_session_end.sh\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,26 @@
+# Internal docs belong in docs/internal/loreconvo/ (private repo root)
+# This .gitignore exists as a safety net — nothing sensitive should
+# be stored in this directory in the first place.
+*.xlsx
+*.env
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+*.db
+*.sqlite
+# LanceDB vector index (runtime data, lives at ~/.loreconvo/sessions.lance/ -- never tracked)
+sessions.lance/
+*.lance/
+*.log
+.DS_Store
+# tests/, test_*.py, and CLAUDE.md are TRACKED in the monorepo and stripped
+# from public repos at publish time by scripts/_subtree_push_filtered.sh.
+# Do NOT re-ignore.

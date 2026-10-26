@@ -1,0 +1,704 @@
+# LoreConvo Installation Guide
+
+**LoreConvo** gives Claude persistent memory across sessions. When you finish a session,
+LoreConvo saves a summary. When you start a new session, it loads the most relevant
+context automatically. Works with Claude Code and Cowork.
+
+---
+
+## Prerequisites
+
+- **uv** (which provides `uvx`) -- this is the only thing you need to install
+- Claude Code or Cowork installed
+
+LoreConvo runs through `uvx`, which downloads a pinned copy of the server and
+manages its own Python. You do not need to create a virtual environment, and you
+do not need a particular system Python.
+
+Install uv if you do not have it:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+Check it is available:
+
+```bash
+uvx --version
+```
+
+If that prints a version, you are good to go.
+
+---
+
+## Option A: Install as a Claude Code or Cowork Plugin (Recommended)
+
+Add the Labyrinth Analytics plugin marketplace, then install LoreConvo from it:
+
+```
+/plugin marketplace add labyrinth-analytics/claude-plugins
+/plugin install loreconvo@labyrinth-analytics-claude-plugins
+```
+
+Then restart Claude Code or Cowork. LoreConvo MCP tools will be available in your next session.
+
+---
+
+## Option B: Developer Install
+
+Clone the repo and run the one-command installer:
+
+```bash
+git clone https://github.com/labyrinth-analytics/loreconvo.git
+cd loreconvo
+bash install.sh
+```
+
+The installer will:
+1. Check that `uv` is available (nothing is pip-installed)
+2. Set the correct execute permissions on the hook scripts
+3. Create the database directory at `~/.loreconvo/`
+
+You should see output ending with `Installation complete!`.
+
+The server itself is not installed into a virtual environment. It runs via
+`uvx --from loreconvo[server]==<version> loreconvo`, pinned to the version the plugin shipped with, and
+uvx fetches it on first use.
+
+### Running from a working copy
+
+To run the code in your clone rather than the published version:
+
+```bash
+uv run --with . loreconvo
+```
+
+---
+
+## Connecting to Claude Code
+
+After installation, register LoreConvo with Claude Code using the `claude mcp add` command:
+
+```bash
+claude mcp add --scope user \
+  "--env=LORECONVO_PRO=<your-license-key>" \
+  loreconvo -- \
+  uvx --from loreconvo[server]==<version> loreconvo
+```
+
+Replace `<version>` with the version you want to pin to (for example `0.10.17`).
+There is no path to substitute: uvx resolves the package itself.
+
+The `--env=LORECONVO_PRO=<your-license-key>` flag is optional -- omit it if you are using the free tier. The `--scope user` flag registers LoreConvo for all Claude Code sessions (not just the current project).
+
+> **Why pin an exact version?** The pin is what makes an install reproducible
+> and an upgrade deliberate. An unpinned `uvx --from loreconvo[server] loreconvo` can change underneath
+> you mid-session. The plugin ships a generated `.mcp.json` carrying the pin for
+> exactly this reason.
+
+> **Why `claude mcp add` instead of editing settings.json?** Claude Code reads
+> user-level MCP servers from `~/.claude.json`, managed by `claude mcp add --scope user`.
+> Adding `mcpServers` entries to `~/.claude/settings.json` is silently ignored --
+> the server will not load. (GitHub issue #4976.)
+
+### Environment variables
+
+| Variable | What it is for | How to set it |
+|----------|---------------|--------------|
+| `LORECONVO_PRO` | Your Pro license key (optional) | `--env=LORECONVO_PRO=<key>` in the `claude mcp add` command |
+| `LORECONVO_DB_PATH` | Path to your session memory database (optional) | `--env=LORECONVO_DB_PATH=/path/to/sessions.db` in the command |
+| `LORECONVO_PROJECT_PATH` | Directory to scan for MEMORY.md at session start (optional) | `--env=LORECONVO_PROJECT_PATH=/path/to/project` in the command |
+| `LORECONVO_DREAM_INJECT` | Controls whether the memory digest is injected at session start (optional) | Set to `false` to disable digest injection globally: `--env=LORECONVO_DREAM_INJECT=false` |
+| `LORECONVO_ANTHROPIC_API_KEY` | Anthropic API key for async LLM session summarization -- Pro only, optional | `--env=LORECONVO_ANTHROPIC_API_KEY=<key>` in the `claude mcp add` command. Note: this is separate from `ANTHROPIC_API_KEY`; LoreConvo uses its own key so it never interferes with your main Claude session budget. |
+| `LORECONVO_SUMMARIZER_DAILY_CAP` | Maximum sessions to upgrade via LLM summarization per day (optional, default: 100) -- Pro only | `--env=LORECONVO_SUMMARIZER_DAILY_CAP=50` to reduce API spend |
+| `LORECONVO_EMBEDDING_LINKS` | Disable embedding-based session auto-links (optional) -- Pro only | Set to `0` to use keyword co-occurrence links only: `--env=LORECONVO_EMBEDDING_LINKS=0` |
+| `HF_HUB_OFFLINE` | Blocks HuggingFace Hub network calls after the initial model download (Pro tier only, optional) | Set to `1` to prevent all post-download hub requests: `--env=HF_HUB_OFFLINE=1` |
+
+If `LORECONVO_DB_PATH` is not set, LoreConvo defaults to `~/.loreconvo/sessions.db`.
+If `LORECONVO_PRO` is not set, LoreConvo runs on the free tier (up to 50 sessions). To upgrade, use the Pro link in README.md; your license key is emailed automatically to your checkout address, usually within a few minutes.
+If `LORECONVO_PROJECT_PATH` is not set, LoreConvo scans the current working directory for a MEMORY.md file.
+
+### Verify the connection
+
+After running `claude mcp add`, restart Claude Code. Run the `/mcp` command in Claude
+to verify LoreConvo is connected. You should see `loreconvo` listed with a green status.
+
+---
+
+## Connecting to Cursor IDE
+
+Cursor uses the same MCP protocol as Claude Code. Configure it by creating a `.cursor/mcp.json` file in your project root:
+
+```json
+{
+  "mcpServers": {
+    "loreconvo": {
+      "command": "uvx",
+      "args": ["--from", "loreconvo[server]==<version>", "loreconvo"],
+      "env": {
+        "LORECONVO_PRO": "your-license-key"
+      }
+    }
+  }
+}
+```
+
+Or copy `.mcp.json` as `.cursor/mcp.json` if you already have a working Claude Code setup.
+
+Restart Cursor after adding the configuration. LoreConvo MCP tools will be available in the next Cursor session.
+
+---
+
+## Connecting to OpenAI Codex
+
+Codex uses a TOML config file at `~/.codex/config.toml`. Add a `[mcp_servers.loreconvo]` section:
+
+```toml
+[mcp_servers.loreconvo]
+command = "uvx"
+args = ["loreconvo==<version>"]
+
+[mcp_servers.loreconvo.env]
+CODEX_HOME = "/Users/your-username/.codex"  # Required by Codex to locate its own config when running MCP servers as subprocesses
+LORECONVO_PRO = "your-license-key"
+```
+
+Replace `<version>` with the version you want to pin to, and `your-username` / `your-license-key` with your values. There is no install path to substitute -- uvx resolves the package itself.
+
+**macOS note:** `~/.Codex/config.toml` (capital C) resolves to the same location on a case-insensitive filesystem. The canonical path is lowercase `~/.codex/config.toml`.
+
+Restart Codex after saving the file. LoreConvo MCP tools will be available in the next Codex session.
+
+---
+
+## Connecting to Hermes Agent
+
+LoreConvo is listed in the Hermes plugin catalog and can be installed with one command. You can also connect LoreConvo as an MCP server if you prefer the MCP approach.
+
+### Option A: Hermes Plugin Catalog (Recommended for simplest setup)
+
+This is the simplest way to add LoreConvo to Hermes. The catalog installs LoreConvo as a native Hermes memory provider -- it reads and writes the same `~/.loreconvo/sessions.db` as your other LoreConvo clients.
+
+> **Tool coverage note:** The catalog integration exposes 3 tools (search, context retrieval, and save). It does not support Pro license keys. If you need the full 40-tool MCP suite or Pro features (consolidation, semantic search, anti-pattern tagging, etc.), use Option B instead.
+
+**First install:**
+
+```bash
+hermes plugins install loreconvo
+```
+
+The installer shows a disclosure and asks three questions:
+
+1. **`LORECONVO_HERMES_PROJECT`:** The default project name for sessions Hermes saves to LoreConvo.
+   - Press Enter (leave it empty) unless you want every Hermes session filed under a specific project name. An empty value means LoreConvo uses `"hermes"` as the project, which is correct for most setups. You can change this later in `~/.hermes/.env`.
+
+2. **"Enable 'loreconvo' now?":** Answer `y`.
+   - Hermes plugins install disabled by default. This step activates the plugin for your current profile.
+
+3. **"Prepare these with Hermes through PM now?" (Python deps):** Answer `y`.
+   - This installs the `loreconvo` package into Hermes' managed Python environment. If you answer `n`, run these two commands afterwards:
+     ```bash
+     hermes plugins enable loreconvo
+     hermes pm repair
+     ```
+
+**Verify the install:**
+
+```bash
+hermes plugins doctor
+```
+
+You should see `loreconvo` listed as enabled with manifest, import, and registration checks all passing. A warning that the pip dependency is not installed until the plugin is enabled is expected during a fresh install and resolves after enabling.
+
+---
+
+**Upgrading from a non-catalog install** (for example, a development copy or a manual install from before the catalog listing):
+
+- `hermes plugins install loreconvo` fails with "Plugin 'loreconvo' already exists"
+- `hermes plugins update loreconvo` fails with "was not installed from git (no .git directory). Cannot update."
+
+The working fix is to remove the old install and re-install from the catalog:
+
+```bash
+rm -rf ~/.hermes/plugins/loreconvo
+hermes plugins install loreconvo
+```
+
+Your session data in `~/.loreconvo/sessions.db` is stored outside the plugin directory and is not affected by this removal.
+
+After re-installing from the catalog, future upgrades should use:
+
+```bash
+hermes plugins update loreconvo
+```
+
+> Note: catalog-based updates via `hermes plugins update` are the expected path but have not been verified by Labyrinth Analytics as of this writing.
+
+---
+
+### Option B: MCP Server via YAML Config
+
+Hermes Agent also supports LoreConvo as an MCP server through its YAML config file. This gives you the full set of 40 LoreConvo MCP tools rather than the three catalog provider tools.
+
+Add an entry under `mcp_servers:` in `~/.hermes/config.yaml`:
+
+```yaml
+mcp_servers:
+  loreconvo:
+    command: uvx
+    args:
+      - loreconvo==<version>
+    enabled: true
+    env:
+      LORECONVO_PRO: your-license-key
+```
+
+Replace `<version>` with the version you want to pin to and `your-license-key` with your Pro license key. Omit the `LORECONVO_PRO` line if you are using the free tier. There is no install path to substitute -- uvx resolves the package itself.
+
+Restart Hermes Agent after saving the file. LoreConvo MCP tools will be available in the next Hermes session.
+
+---
+
+## Setting Up Auto-Save and Auto-Load
+
+Install these hooks once and every session is captured automatically -- no `save_session`
+call needed. When you finish a session, the SessionEnd hook saves a structured summary
+(decisions, artifacts, open questions) to your local database. When you start a new
+session, the SessionStart hook loads the most relevant recent context back in.
+
+This uses Claude Code hooks.
+
+After running `install.sh`, add the hooks to `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/YOUR_USERNAME/projects/loreconvo/hooks/on_session_start.sh"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/YOUR_USERNAME/projects/loreconvo/hooks/on_session_end.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Replace `YOUR_USERNAME` with your actual Mac username.
+
+> **If hooks were silently not running:** This was a known issue fixed in the 2026-04-06
+> release. The install script now sets the correct execute permissions. If you installed
+> before that fix, run `bash install.sh` again from your loreconvo directory to fix it.
+
+### MEMORY.md Auto-Indexing
+
+If your project has a `MEMORY.md` file, the SessionStart hook automatically indexes it into LoreConvo at the start of each session. No extra setup is required -- it happens as part of the hook you already configured above.
+
+The MEMORY.md content is stored as a searchable entry tagged `memory_md`. Claude can find it alongside regular session history when you ask it to recall project conventions or decisions.
+
+**To point LoreConvo at a specific project directory** (instead of the current working directory), add `LORECONVO_PROJECT_PATH` as an env flag in your `claude mcp add` command:
+
+```bash
+claude mcp add --scope user \
+  "--env=LORECONVO_PRO=<your-license-key>" \
+  "--env=LORECONVO_PROJECT_PATH=/Users/YOUR_USERNAME/projects/my_project" \
+  loreconvo -- \
+  uvx --from loreconvo[server]==<version> loreconvo
+```
+
+Replace `YOUR_USERNAME` and `my_project` with your actual values. Use the full absolute path -- do not use `~` or `$HOME`.
+
+If you have multiple projects, leave `LORECONVO_PROJECT_PATH` unset. The hook will use wherever Claude Code is opened as the project directory, which is correct for most setups.
+
+---
+
+### PreCompact Hook (Recommended)
+
+LoreConvo can also save your session before Claude Code compresses the context window.
+This fires both when you manually run `/compact` and when Claude Code automatically
+compresses because the context limit was reached. No session context is lost.
+
+Add the PreCompact hook to your `~/.claude/settings.json` alongside the SessionStart
+and SessionEnd hooks above:
+
+```json
+{
+  "hooks": {
+    "PreCompact": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/YOUR_USERNAME/projects/loreconvo/hooks/scripts/on_pre_compact.sh",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Replace `YOUR_USERNAME` with your actual Mac username.
+
+After adding this hook, restart Claude Code. You can verify it is working by running
+`/compact` and then checking `~/.loreconvo/hook.log` for a line like:
+
+```
+[Mon Apr 21 10:00:00 PDT 2026] pre-compact (manual): <session-id>
+```
+
+If you see that line, the hook is saving your session before compaction.
+
+---
+
+### Post-Turn Capture (Opt-In, Pro)
+
+Post-turn capture takes a lightweight snapshot after every N tool calls during a session. Unlike the SessionEnd hook (which saves once at the end), post-turn capture builds an incremental record of how your session evolved -- useful for long-running or complex sessions where mid-session state matters.
+
+**This hook is opt-in and disabled by default.** The plugin registers it as a PostToolUse event, but it exits immediately unless you set the environment variable below.
+
+**To enable,** add `LORECONVO_POST_TURN_CAPTURE=1` to your `claude mcp add` command:
+
+```bash
+claude mcp add --scope user \
+  "--env=LORECONVO_POST_TURN_CAPTURE=1" \
+  "--env=LORECONVO_PRO=<your-license-key>" \
+  loreconvo -- \
+  uvx --from loreconvo[server]==<version> loreconvo
+```
+
+**How it works:**
+
+1. **Stage 1 (fast, every N tool calls):** `post_turn_capture.py` enqueues a snapshot to `~/.loreconvo/capture_queue/` and exits. The interval is per-session and controlled by `LORECONVO_TURN_CAPTURE_INTERVAL` (default: every 10 tool calls).
+2. **Stage 2 (async worker):** `capture_worker.py` drains the queue, summarizes captured content using `claude-haiku-4-5-20251001`, and saves to your database.
+
+**Environment variables:**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LORECONVO_POST_TURN_CAPTURE` | `0` | Set to `1` to enable. Any other value disables. |
+| `LORECONVO_TURN_CAPTURE_INTERVAL` | `10` | Tool calls between snapshots (per session). |
+| `LORECONVO_TURN_CAPTURE_MAX_CALLS_PER_DAY` | `100` | Daily cap on Haiku API calls across all sessions. |
+
+**Requirements:**
+
+- **Pro license required.** The worker checks your Pro license before making API calls.
+- **`anthropic` package required.** Install it with: `pip install anthropic`
+  The `anthropic` package is not included in the base LoreConvo install. If it is not installed, the worker skips API calls silently.
+- **API key required.** Set `ANTHROPIC_API_KEY` in your environment.
+
+**Queue cleanup:** Queue entries older than 7 days are discarded automatically. If the daily cap is reached, remaining queue entries are held until the next day.
+
+---
+
+## Memory Recall (Dreaming)
+
+Starting with v0.6.0, LoreConvo can consolidate your session history into a persistent memory digest. After you have saved 10 or more sessions, run the consolidation tool once to give Claude a compact summary of your project's standing decisions, open questions, and tech stack facts. The digest is automatically injected at session start from then on.
+
+### How to run consolidation
+
+Ask Claude:
+
+> "Run consolidate_memories for the side_hustle project."
+
+Claude calls `consolidate_memories` with your project name. The tool analyzes your recent sessions and writes a digest. You will see a summary of decisions extracted, open questions found, and a formatted markdown brief.
+
+**Free tier:** up to 3 on-demand consolidations per day. Pro users have unlimited runs.
+
+### After a consolidation run
+
+The digest is injected into every future session start automatically. If you want to read it without running a new consolidation, ask:
+
+> "Show me the current memory digest for side_hustle."
+
+Claude calls `get_memory_digest` and returns the stored digest.
+
+To see a log of all consolidation runs, ask:
+
+> "Show me the consolidation log for side_hustle."
+
+Claude calls `get_dream_log` and returns timestamps, session counts, and trigger information for recent runs.
+
+### Disabling digest injection
+
+If you want to suppress digest injection for a project without deleting the digest, set the environment variable:
+
+```
+LORECONVO_DREAM_INJECT=false
+```
+
+Add it via `--env=LORECONVO_DREAM_INJECT=false` in your `claude mcp add` command. This disables injection globally across all projects. To disable injection for one project only, ask Claude to call `get_memory_digest` with `disable=true`.
+
+### Known limitations (v0.6.0)
+
+- **no-llm tag:** If you tag a session with `no-llm`, it is excluded from future LLM-mode consolidation (v0.6.1). In v0.6.0 heuristic mode, all sessions are processed regardless of this tag.
+- **Bulk imports leave the digest stale.** If you import a batch of sessions, the digest is not updated until you run `consolidate_memories` again. LoreConvo uses the `updated_at` timestamp on the digest to determine freshness -- importing sessions does not update that timestamp.
+- **Project or surface renames strand the digest.** Digests are keyed by project name and surface. If you rename a project in `--project` tags, the old digest is no longer linked. Run `consolidate_memories` again after renaming.
+- **Free-tier rate limit is enforced in the MCP layer.** The 3/day limit applies to calls through the MCP tool. The Python consolidation library does not enforce this limit if called directly.
+
+### Setting session expiry (TTL)
+
+You can mark any session to expire on a specific date. After the date passes, the session is hidden from search results and the auto-load hook -- but it is not deleted and can be recovered manually.
+
+Ask Claude:
+
+> "Set the debugging notes session to expire on June 1st, 2027."
+
+Claude calls `set_session_expiry` with the session UUID and the ISO 8601 expiry date. To clear an expiry you previously set, ask Claude to call `set_session_expiry` with `expires_at=null`.
+
+---
+
+## Verifying the Installation
+
+After connecting LoreConvo to Claude Code or Cowork, verify it is working:
+
+**In Claude Code**, run:
+
+```
+/mcp
+```
+
+You should see `loreconvo` listed. Then ask Claude:
+
+```
+Call the get_recent_sessions tool with limit 5
+```
+
+If LoreConvo is working, Claude will respond with a list of your recent sessions
+(or an empty list if this is your first time). If you see an error, check the
+Troubleshooting section below.
+
+---
+
+## Troubleshooting
+
+**"Module not found" or "command not found" error**
+
+Usually the pinned environment is incomplete or stale. Refresh it -- uvx rebuilds
+the environment from scratch:
+
+```bash
+uvx --refresh --from loreconvo[server]==<version> loreconvo
+```
+
+Use the same version your client is configured with (see `.mcp.json`). There is
+no `.venv/` to delete: since the unified-uvx release, nothing is pip-installed
+into the source tree.
+
+**Hooks are not running (no auto-save/load)**
+
+Check that the hook scripts have execute permission:
+
+```bash
+ls -la /path/to/loreconvo/hooks/
+```
+
+You should see `-rwxr-xr-x` for the `.sh` files. If you see `-rw-r--r--` (no `x`), run:
+
+```bash
+chmod +x /path/to/loreconvo/hooks/on_session_start.sh
+chmod +x /path/to/loreconvo/hooks/on_session_end.sh
+chmod +x /path/to/loreconvo/hooks/scripts/on_pre_compact.sh
+```
+
+Or simply re-run `bash install.sh` -- it sets the permissions automatically.
+
+**`$HOME` or `~` not expanding in settings.json**
+
+Claude Code does not expand shell variables in `settings.json`. Replace any `~` or
+`$HOME` with the full absolute path to your home directory
+(e.g., `/Users/debbie` instead of `~`).
+
+**Free tier limit reached**
+
+The free tier supports up to 50 sessions. When you reach the limit, `save_session`
+returns a message explaining how to upgrade. Contact Labyrinth Analytics for a Pro
+license key, then re-run `claude mcp add --scope user` with `--env=LORECONVO_PRO=<your-key>` included.
+
+---
+
+## Upgrading
+
+To upgrade LoreConvo to the latest version:
+
+```bash
+cd /path/to/loreconvo
+git pull
+bash install.sh
+```
+
+The installer detects the existing venv and updates it in place. Your session data
+at `~/.loreconvo/sessions.db` is preserved.
+
+---
+
+## Schema Migrations
+
+Schema migrations are automatic -- there is no manual step. When a new version of
+LoreConvo adds database columns or tables, the migration runs the next time LoreConvo
+starts after you upgrade (when the MCP server loads or you run any CLI command). Your
+session data at `~/.loreconvo/sessions.db` is preserved.
+
+Migrations are idempotent (safe to run repeatedly) and apply in-place, so upgrading
+from any earlier version brings your existing database fully up to date with no action
+on your part. For example, the v0.7.0 upgrade automatically adds the `summary_source`,
+`summary_retry_count`, and `fallback_reason` columns and creates the `cap_state` and
+`schema_migration_log` tables needed for async LLM summarization.
+
+---
+
+## Data Storage
+
+All session memory is stored locally at `~/.loreconvo/sessions.db`. Nothing is sent
+to any cloud service. You own your data.
+
+---
+
+## Privacy Note: summarize=True
+
+By default, LoreConvo stores session data locally with no external network calls.
+If you pass `summarize=True` to `save_session`, LoreConvo sends the session summary
+to the Anthropic API (using your `ANTHROPIC_API_KEY`) to produce a compressed version
+before saving locally. This is opt-in and disabled by default.
+
+When `summarize=True`:
+- Your session summary is transmitted to Anthropic and is subject to Anthropic's
+  [Privacy Policy](https://www.anthropic.com/legal/privacy).
+- If `ANTHROPIC_API_KEY` is not set, or the API call fails for any reason, LoreConvo
+  falls back to saving the raw summary. Session saves never fail due to this feature.
+- The `anthropic` package must be installed: `pip install loreconvo[bridge]`
+
+---
+
+## Security note for Pro users
+
+When you enable the Pro tier and build the semantic index, LoreConvo creates a
+`sessions.lance/` directory under your data root (default: `~/.loreconvo/`). This
+directory stores vector representations (embeddings) of your session titles and
+summaries. The directory is protected with mode 700 (owner-only access on POSIX
+systems).
+
+If you back up your data root, include this directory in your backup -- and treat
+the backup with the same sensitivity as the source data, since the vectors encode
+the semantic content of your session history.
+
+### HuggingFace Hub network calls (Pro tier)
+
+The Pro tier loads the BGE-small-en-v1.5 embedding model (~130 MB) from HuggingFace
+on first use. This is a one-time download. After the download, inference runs entirely
+locally -- no session data is transmitted to HuggingFace.
+
+However, the `huggingface-hub` library (a dependency of `fastembed`) may
+make occasional metadata checks to the HuggingFace API after the initial download --
+for example, to verify model card updates. No session content is included in these
+requests, but they are outbound network calls.
+
+If you want to ensure LoreConvo makes no network calls after the initial model
+download, set this environment variable:
+
+```
+HF_HUB_OFFLINE=1
+```
+
+Add it to your `claude mcp add` command:
+
+```bash
+claude mcp add --scope user \
+  "--env=LORECONVO_PRO=<your-license-key>" \
+  "--env=HF_HUB_OFFLINE=1" \
+  loreconvo -- \
+  uvx --from loreconvo[server]==<version> loreconvo
+```
+
+With `HF_HUB_OFFLINE=1`, the model loads from the local cache and all HuggingFace
+API requests are blocked. Make sure the model has been downloaded at least once before
+setting this flag, or semantic search initialization will fail.
+
+---
+
+## How LoreConvo Accesses Your Data
+
+LoreConvo provides three ways to read and write your session memory:
+
+**MCP tools** are the primary method. Claude uses these automatically during sessions -- tools
+like `save_session`, `get_recent_sessions`, and `search_sessions` connect through the MCP server.
+
+**CLI commands** let you manage sessions from your terminal independent of any Claude session.
+After installation, run `loreconvo-cli --help` to see available commands.
+
+**Bundled scripts** are the automatic fallback. If the MCP server is unavailable (for example,
+after a startup timeout or a rejected tool call), LoreConvo switches to these scripts silently.
+The plugin skill handles this; no action is needed on your part.
+
+All three methods read and write the same database at `~/.loreconvo/sessions.db`. Switching
+between them never causes data loss.
+
+---
+
+## LoreConvo + Claude Code Auto-Memory: How They Coexist
+
+If you use Claude Code's built-in auto-memory alongside LoreConvo, you may wonder
+whether they conflict. They do not. They answer different questions and serve different
+purposes, and they are designed to work together without friction.
+
+**Claude Code auto-memory (`MEMORY.md`)** is Claude's own mechanism for remembering
+persistent facts about you and your project. The model updates a `MEMORY.md` file in your
+project's memory directory (`~/.claude/projects/<project>/memory/`) with preferences, standing
+decisions, environment details, and reminders. It answers: "What should the model remember
+to stay effective in this project?"
+
+**LoreConvo** stores cross-session narratives: what happened during a session, why decisions
+were made, which questions are still open, and what artifacts were produced. Each session
+summary is saved automatically when you close a Claude Code session (via the SessionEnd
+hook), and the most relevant summaries are injected back at the start of your next session
+(via the SessionStart hook). LoreConvo works across Claude Code, Cowork, and Chat. It
+answers: "What happened last session, what was decided, and what is still unresolved?"
+
+**How they relate:** LoreConvo reads your `MEMORY.md` once per session at startup—it
+indexes the content as a searchable entry so you can find relevant project facts
+alongside your session history. LoreConvo never modifies `MEMORY.md` and does not claim
+ownership of it; Claude Code owns and manages that file. The result is that you can
+search LoreConvo for both "what happened in my sessions" and "what conventions is my
+project operating under" in a single query—your project facts become part of your
+searchable session context.
+
+LoreConvo's unique advantages over `MEMORY.md` alone:
+- **Cross-surface:** your session history follows you from Claude Code to Cowork to Chat
+- **Searchable history:** full-text search across all your sessions, not just today's snapshot
+- **Team memory (Pro):** share session history with teammates -- export sessions to JSON, teammates import with `python -m loreconvo.cli merge` (no server required)
+- **Session linking:** explicitly connect related sessions and decisions for audit trails
+
+To run both:
+
+- Install LoreConvo and set up the hooks (see above)
+- Use Claude Code's auto-memory as Anthropic ships it -- no extra configuration
+
+That is all. There is no integration step. They work together automatically. If your
+`MEMORY.md` file grows large, Claude Code handles that. LoreConvo will continue to
+index it at the start of each session.
+
+---
+
+## More Documentation
+
+- [Quickstart Guide](docs/quickstart.md) -- get up and running in 5 minutes
+- [CLI Reference](docs/cli_reference.md) -- manage sessions from the terminal
+- [MCP Tool Catalog](docs/mcp_tool_catalog.md) -- all 26 tools explained in plain English
+- [Changelog](docs/CHANGELOG.md) -- what changed in each release

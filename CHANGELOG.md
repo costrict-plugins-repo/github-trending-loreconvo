@@ -1,0 +1,1184 @@
+# LoreConvo Changelog
+
+## v0.10.19 (2026-10-23)
+
+### Security
+
+- SH-104211: `_auto_link_cooccurrences` and the `get_related_sessions`
+  `cooc_rows` query joined `session_cooccurrences` on shared term with no
+  project filter, unlike `_auto_link_embeddings`. Both now join `sessions`
+  on both sides and require `s2.project IS s1.project` (NULL-safe). Existing
+  cross-project `auto:cooccurrence` rows in `session_links` are NOT migrated
+  or deleted.
+
+### Fixed
+
+- SH-104576 / SH-104634: bridge cross-product link query is now
+  bidirectional (links created from the LoreDocs side were not returned).
+
+### Changed
+
+- SH-104370: `click`, `cryptography`, `packaging` moved from exact pins to
+  bounded ranges (`>=floor,<next-major`) in `pyproject.toml` with per-dep
+  `# allow-range` markers. `requirements.txt` stays exact-pinned. Reason: the
+  Hermes memory provider installs loreconvo into Hermes's environment, so
+  exact pins on shared packages broke catalog installs on every Hermes bump.
+
+## v0.10.18 (2026-10-16)
+
+### Security
+
+- Updated the MCP library (`mcp[cli]`) from 1.28.1 to 1.30.0 to fix
+  CVE-2026-59951. The startup compatibility check now expects 1.30.0, so
+  correctly updated installs no longer show a false version-mismatch warning.
+
+### Docs
+
+- INSTALL now points to the public plugin marketplace and lists the correct
+  tool count (40).
+
+## v0.10.17 (2026-10-15)
+
+### rebuild_index: background rebuild, progress, exclusion enumeration (SH-103913, SH-103914)
+
+`rebuild_index` now runs in a background thread and returns immediately with
+a status handle, so the MCP server stays responsive to other tool calls
+(including FTS search and get_stats) while the rebuild runs. A new
+`rebuild_index_status` tool polls progress (phase, count, percentage,
+elapsed seconds).
+
+The rebuild response now enumerates excluded sessions by reason
+(`external_tool_session`, `source_periodic`, `source_file_memory`,
+`skill_title`, `skill_summary`, `missing_id`, `missing_title`,
+`missing_summary`), so `indexed + sum(exclusions) == total_in_db` is
+checkable from the response alone.
+
+The new index is built in a temp directory and atomically swapped in, so
+interrupting a rebuild (kill, crash, timeout) leaves the previous index
+intact and usable -- no partial lance directory.
+
+Embedding is now batched (256 texts per batch, SH-103924) with progress updates after
+each batch, replacing the previous single-call path that held the server
+blocked for the entire duration.
+
+`get_stats` (Pro tier) now includes a `semantic_index` section with
+`available` (bool) and `sessions_indexed` (count) so users can see how many
+sessions are semantically searchable.
+
+The docstring previously said "may take 1-2 minutes for large session
+stores"; the measured time on 7.5k sessions was 37 minutes. The docstring now
+says "3-10 minutes per thousand sessions" and the CLI shows the elapsed time.
+
+### Fix: _truncate_if_needed respects max_length when cap is smaller than the marker (SH-102442)
+
+`core/storage_core.py`: `_truncate_if_needed` could return a value longer
+than `max_length` when `max_length` was smaller than the truncation marker
+itself (e.g. `max_length=20` with a 41-char marker). Added a guard that
+short-circuits to a plain slice in that case. `hooks/scripts/auto_save.py`
+aliases this function, so the fix applies there too; its test
+`test_edge_case_very_short_max_length` previously asserted the overshoot as
+correct behavior and was updated to assert the length cap. Mutation-tested
+(removing the guard fails `test_truncate_marker_longer_than_cap_still_respects_cap`).
+
+### Fix: Hermes provider gates memory reads on primary context (SH-103558)
+
+`integrations/hermes/__init__.py`: `prefetch()` and `system_prompt_block()`
+now return empty string when `_is_primary` is False (agent_context
+cron/flush/subagent), preventing context injection into cron/fleet sessions.
+Avoids token overhead and stale context in scheduled agent runs. Regression
+tests parametrize both methods over primary/default/cron/flush/subagent and
+were mutation-tested.
+
+### LanceDB 0.30.2 -> 0.34.0
+
+Bumped lancedb from 0.30.2 to 0.34.0 in both pyproject.toml and
+requirements.txt. Exact pin (no range). Required for co-installability
+with the Hermes Agent lancedb-suite plugin, which requires lancedb==0.34.0.
+Full test suite passes (522 passed, 1 pre-existing flake). Known:
+create_fts_index emits deprecation warnings on 0.34.0 (migration tracked
+separately).
+
+### Hermes plugin quarantine declaration
+
+Added `integrations/hermes/pyproject.toml` declaring the hermes-plugin-loreconvo
+package with `[tool.uv.exclude-newer-package] loreconvo = false` (exempts
+LoreConvo from Hermes' proposed 14-day release quarantine). The version is
+pinned in two places; a new check script
+`scripts/check_hermes_plugin_version_sync.py` validates both match the product
+version (mutation-tested: mismatched version returns exit code 2).
+
+### Project-name normalization (SH-103918, SH-103942, SH-103956)
+
+`core/storage_core.py`: new `normalize_project_name()` + `PROJECT_ALIASES`
+(case, underscore-collapse, alias resolution; empty string -> None). Applied
+on `save_session` and on the `project` param of `search_sessions` and
+`get_recent_sessions`. A startup migration normalizes existing
+`sessions.project` values in place. `get_context_for` runs a supplementary
+project-filtered search when the topic normalizes to a project name. The
+first cut passed the lowercased topic as the primary FTS query, breaking
+camelCase compound-token expansion (QA HIGH, SH-103942); fixed by keeping the
+original topic as the primary query. Regression test SH-103956.
+
+### FTS query construction (SH-103916, SH-103927)
+
+`core/storage_core.py`: prefix-match threshold for purely alphabetic tokens
+raised from <=7 to <=10 chars; explicit trailing wildcards are honored.
+snake_case tokens are no longer expanded inside compound-token queries
+(reduced BM25 saturation).
+
+### vault_suggest all-time fallback (SH-104015)
+
+`get_suggestions()` fallback now calls `_get_suggestions_with_window(36500)`
+instead of returning the 14-day result relabeled with all-time metadata, so
+`skill_gaps`/`scan_count` agree with `expansion_note`.
+
+### vault_suggest skill-gap window expansion (SH-104057, SH-104064)
+
+In-window skill gaps no longer suppress window expansion in
+`get_suggestions()`; expansion proceeds when the project-scoped revisit list
+is empty.
+
+### Shared embedding model (SH-104068)
+
+`core/hybrid_search.py`: new `get_shared_embedding_model()` caches one
+fastembed `TextEmbedding` per model name per process (lock-guarded);
+`LanceIndex` and the cross-link path in `core/database.py` use it.
+`SessionDatabase.close()` drops its `_lance_index`. Fixes native-memory growth
+(~70 MB RSS per instance) behind the test-suite OOMs.
+
+### Lance coverage guard + rebuild batch size (SH-103940, SH-103924)
+
+`core/database.py`: startup guard checks Lance index coverage against the
+sessions table; `get_stats` reports coverage. `REBUILD_BATCH_SIZE` raised
+from 128 to 256.
+
+### Diagnostics and docstrings (SH-103912, SH-103915, SH-103917, SH-103919, SH-103928, SH-103938, SH-103960)
+
+Cooccurrence backfill script; known-item recall probe script; diagnostic
+scripts routed through `_bootstrap.py`; docstring clarifications for
+`search_sessions` (semantic vs FTS5, prefix matching), `vault_suggest`
+(window expansion), and `get_memory_digest` (session-based).
+
+## v0.10.16 (2026-10-05)
+
+### Fix: plugin MCP server now starts (SH-103398)
+
+The 0.10.14 move of `mcp[cli]` and `starlette` to the `[server]` extra
+broke the `.mcp.json` launch line: `uvx loreconvo==<version>` no longer
+installed the MCP server stack, so the server crashed with
+`ModuleNotFoundError: No module named 'mcp'`. The generated `.mcp.json`
+now uses `uvx --from loreconvo[server]==<version> loreconvo`, which
+resolves the extra. A clear error message is also printed if the server
+is launched without the extra. A release-gate smoke test now validates
+the `.mcp.json` command starts a working MCP server before every release.
+
+### Fix: Hermes provider gates memory writes on primary context
+
+`integrations/hermes/__init__.py`: `on_memory_write` now returns early when
+`_is_primary` is False (agent_context cron/flush/subagent), matching the
+existing `on_session_end` gate. Regression tests parametrize both hooks over
+primary/default/cron/flush/subagent and were mutation-tested.
+
+## v0.10.15 (2026-10-02)
+
+### click pin: 8.3.3 -> 8.4.2
+
+Bumped for Hermes Agent core compatibility (hermes-agent's huggingface-hub
+requires click>=8.4.2).
+
+## v0.10.14 (2026-10-02)
+
+### Dependencies: MCP server stack moved to [server] extra
+
+`mcp[cli]` and `starlette` moved from base to `[server]` extra. Base install
+is leaner for non-server use cases. `cryptography` bumped to 50.0.1.
+
+## v0.10.13 (2026-10-02)
+
+### integrations/hermes/ (new)
+
+Hermes Agent memory provider plugin. `LoreConvoMemoryProvider` subclasses
+`MemoryProvider` (agent/memory_provider.py). Implements `is_available`,
+`initialize`, `shutdown`, `prefetch`, `sync_turn` (no-op), `on_session_end`,
+`on_memory_write`, and three tools (`loreconvo_search_sessions`,
+`loreconvo_get_context`, `loreconvo_save_memory`). Reads `agent_context`
+from `initialize` kwargs and skips writes for cron/flush/subagent.
+
+### packaging pin: 25.0 -> 26.0
+
+`pyproject.toml`, `requirements.txt`. Hermes Agent venv resolves
+`packaging==26.0`; loreconvo's internal use (`compat_check.py`) is
+compatible with both. Bumped so the memory provider's declared
+`python_dependencies: ["loreconvo==0.10.13"]` resolves under Hermes's
+core constraints.
+## v0.10.12 (2026-09-24)
+
+### Added: memory-item CRUD on the fallback script (SH-102285)
+
+`scripts/save_to_loreconvo.py` gains `--save-memory-item`,
+`--query-memory-items`, `--transition-memory-item`, and
+`--update-memory-item`, each a thin caller of the shared-core memory-item
+methods the MCP tools use. `--read-id` output now includes
+`previous_summary`. `FALLBACK_CONTRACT.md` documents the new ops.
+
+### Added: MCP Server Registry metadata
+
+New `server.json` (name `io.github.labyrinth-analytics/loreconvo`, PyPI
+package over stdio via `uvx`). `README.md` carries the registry's
+`mcp-name:` ownership marker as its final line; the registry validates it
+against the PyPI README of this exact version, so the marker must survive
+any README regeneration.
+
+### Changed: license-delivery wording
+
+`README.md` and `INSTALL.md` now state automatic key delivery within minutes
+(Stripe webhook Lambda) instead of one business day.
+
+## v0.10.11 (2026-09-21)
+
+### Added: observability, export/import, and Pro search/digest ops on shared core (SH-101927, SH-101928, SH-101929, SH-101930)
+
+Export/import logic moved out of `server.py` into `SessionDatabase`
+(`export_payload`, `import_export_file`, `anthropic_export_payload`).
+Observability added `usage_stats_with_hook_status`, `get_dream_log_entries`,
+and `session_map_payload` (via `core/graph.build_session_map_payload`). Pro
+search and consolidation added `related_sessions_payload`,
+`consolidate_memories_payload`, `memory_digest_payload`, and
+`context_for_payload` (carrying the SH-13436 trust framing). `server.py` tools
+are now thin delegators over those methods.
+
+The fallback script (`scripts/save_to_loreconvo.py`) gains 12 ops as a second
+CALLER of the same `SessionDatabase` methods: no raw SQL, no second
+implementation. Pro gating moved with the logic -- `get_related_sessions` and
+`export_for_anthropic` are gated in shared core with the messages `server.py`
+previously used, so free tier still hard-fails with an upgrade message on both
+surfaces. `surface_coverage.FEATURE_SURFACES` and the `FALLBACK_CONTRACT.md`
+tier-(a) table updated; parity gate green.
+
+### Fixed: direct-write save_session truncation now marks the cut (SH-101877)
+
+`truncate_session_fields()` (the direct MCP `save_session` path) now shares
+the hook path's single truncation derivation (`_truncate_if_needed` in
+`core/storage_core.py`): a cut summary, reasoning_notes, decision, or open
+question carries a `[TRUNCATED: <field> exceeds <cap> chars]` marker, reserved
+inside the cap so the stored value never exceeds the ratified length including
+the marker. Previously the direct path sliced silently -- the stored record
+stopped mid-word with no signal on recall. Cap values are unchanged.
+
+### Fixed: shipped docs restated the superseded save caps (SH-102317 QA, SH-102277 QA)
+
+`skills/loreconvo/SKILL.md`, `docs/mcp_tool_catalog.md`, `docs/cli_reference.md`
+and the internal `docs/reference/DATA_DICTIONARY.md` all still stated 8000/500
+for the direct path after SH-101938 raised it to 15000/2000. SKILL.md is the
+consequential one: it ships into user context, so the stale 500 was steering
+callers to compress decisions below the ratified cap. The same paragraphs also
+still described truncation as silent, superseded by the SH-101877 marker, and
+claimed a per-item cap on `artifacts` that `_cap_list` never applied
+(`core/database.py` caps `decisions` and `open_questions` only).
+
+`FALLBACK_CONTRACT.md` claimed the SH-101927 observability ops were covered by
+`test_fallback_mcp_parity.py`; that file does not exercise them. Replaced with
+an accurate statement of what `test_fallback_t3_surfaces.py` does and does not
+guarantee. The `cli_reference.md` version example no longer pins a literal
+version string.
+
+### Changed: direct-path save_session caps raised to 2000/15000 (SH-101938)
+
+`_MAX_DIRECT_SUMMARY_LENGTH` (summary + reasoning_notes) and
+`_MAX_DIRECT_LIST_ITEM_LENGTH` (decisions + open_questions items) are new
+direct-path constants in `core/storage_core.py`, set to 15000 and 2000.
+`truncate_session_fields()` in `core/database.py` (the MCP `save_session`
+write path) now enforces those, while the SessionEnd hook path
+(`hooks/scripts/auto_save.py`) keeps its own 500/8000 pair -- the two
+paths deliberately diverge per the ratified decision (hook caps defend
+unbounded machine-generated transcript text; the direct path holds
+deliberate, authored content). The shared `_truncate_if_needed` derivation
+(SH-101877) is unchanged, so the direct path still marks every cut with
+`[TRUNCATED: <field> exceeds <cap> chars]` inside the cap.
+
+## v0.10.10 (2026-09-15)
+
+### Fixed: memory digests could resurface external or expired sessions (SH-101733)
+
+`HeuristicConsolidator` now records `source_session_ids` on every digest at
+consolidation time (`consolidation.py`). `SessionDatabase._digest_sources_are_eligible()`
+rechecks source eligibility on retrieval and rejects digests with legacy (missing)
+provenance or a `safety_invalidated` flag. `_invalidate_memory_digests_for_session_scope()`
+invalidates both the matching surface digest and the project-wide digest whenever a
+source-affecting write occurs (exclusion toggle, expiry set/clear). Legacy digests
+require reconsolidation to become recallable again; the user-controlled `disabled`
+flag on a digest remains a separate, independent gate.
+
+### Fixed: session export/import silently dropped or reset recall-control fields (SH-101734)
+
+`export_sessions` now serializes the full set of recall-relevant fields (summary,
+decisions, artifacts, tags, external-tool-session flag, expiry, pin state) rather
+than a partial set. `import_session()` (`on_conflict=replace`) leaves omitted fields
+at their current database value instead of resetting them to defaults when replaying
+a legacy export that predates a field. Pinned imports clear expiry. New
+`normalize_expiry_timestamp()` rejects expiry values with no timezone info and
+normalizes timezone-aware values to UTC before they are stored. Scope note:
+`export_sessions` was never a full-store backup and still excludes session links and
+independently-saved memory items (`save_memory_item`); that boundary is unchanged,
+just now documented rather than implied.
+
+### Fixed: Free-tier session cap blocked updates to sessions the user already had (SH-101735)
+
+The Free-tier capacity check in the upsert path now distinguishes a new UUID (still
+rejected at the cap) from an update to an existing session UUID (now permitted
+regardless of cap). Normal upsert and limit behavior for genuinely new sessions is
+unchanged.
+
+### Fixed: FTS tag filter was applied after LIMIT, hiding matches on later pages (SH-101736)
+
+Tag-scoped full-text search now applies the tag predicate before the SQL `LIMIT`, so
+a tag match outside the first unfiltered page of results is no longer silently
+dropped. Ranking behavior for untagged queries is unchanged.
+
+### Fixed: an unchanged summary overwrote the previously-saved distinct summary (SH-101737)
+
+`previous_summary` is now only updated when a save actually changes the summary
+text, checked uniformly across the normal save, async (LLM) save, hook-triggered
+save, and import-with-replace paths. Saving the same summary twice in a row no
+longer clobbers the last genuinely different summary; single-slot history semantics
+are preserved.
+
+### Fixed: opt-in post-turn capture wasn't wired into the shipped plugin (SH-101738)
+
+`LORECONVO_POST_TURN_CAPTURE=1` now actually enables the bundled PostToolUse hook --
+`plugin.json` registers it under `hooks.PostToolUse` for both plugin and package
+installs, which prior 0.10.x versions did not do. The worker (`capture_worker.py`)
+now checks the real Pro license gate instead of a nonexistent `tier_manager`/bypass
+variable. Queue processed-marker handling is corrected so that two drains with no
+new queue entries perform exactly one capture and one API call rather than
+repeating work; shared daily call reservations are serialized against concurrent
+writers.
+
+## v0.10.9 (2026-09-05)
+
+### Fixed: SessionEnd/Stop auto-capture clobber race (SH-101571)
+
+`hooks/scripts/pre_compact_save.py` now guards against overwriting an
+explicit save with a shallow auto-capture: `_has_explicit_save_signature()`
+(imported from `auto_save.py`) is checked before the UPDATE that would
+otherwise silently replace `source='session'`/tagged content with
+`source='periodic'`-style shallow data. New
+`hooks/scripts/detect_clobbered_sessions.py` CLI scans an existing DB for
+sessions with an `auto-captured` tag but no `role:` tag (pre-fix clobber
+victims). 6 new tests (`tests/test_save_clobber_race.py`), including a
+mutation test confirming the guard is load-bearing.
+
+The diagnostic script itself shipped with two same-day follow-on fixes:
+a raw `sqlite3.connect()` that violated the `test_no_duplicate_ddl.py`
+DDL-invariant (rewritten to use the `SessionDatabase` accessor, SH-101582),
+and a package-path bug (`loreconvo.src.core.*` instead of
+`loreconvo.core.*`, matching the actual `pyproject.toml` package-dir
+mapping) that made the script's own documented CLI usage always raise
+`ImportError` (SH-101589).
+
+### Added: fallback contract tier -- `--semantic` and `--get-doc`, env-var hard-fail (SH-101553)
+
+`scripts/save_to_loreconvo.py` gains `--semantic` on `--search` (Pro;
+degrades to keyword search with a stderr tip, never a hard crash),
+delegating to the existing `SessionDatabase.search_sessions(semantic=True)`
+call. `_find_loreconvo_db()` now checks `LORECONVO_DB` ahead of the
+Cowork-mount/home-dir fallbacks; a set-but-unresolvable override hard-fails
+(`sys.exit(1)`, no stdout rows) instead of silently querying a different
+corpus (SH-101500). New canonical contract doc: `FALLBACK_CONTRACT.md`. New
+drift guard: `tests/test_fallback_mcp_parity.py` (5 tests), asserting the
+fallback and the MCP server agree on every tier-(a) read operation,
+including both hard invariants above. Shared `unwrap_result()` helper
+extracted to `internal_tools/loremcp_fixtures/fixtures.py` (fixes a
+FastMCP string-wrapped-JSON unwrapping bug surfaced while writing the
+LoreDocs-side parity test) so both products' parity tests import one
+implementation instead of each redefining `_payload()`.
+
+### Added: capture-time field caps on the MCP direct-write path (SH-101425)
+
+New `core.database.truncate_session_fields()` (single source of truth,
+imported by both `server.py`'s `save_session` MCP tool and `database.py`'s
+direct-write path) applies the same 8000/500-char caps already ratified
+for the SessionEnd hook (SH-13531) to `save_session`'s
+summary/decisions/open_questions/reasoning_notes fields -- closing a
+previously-uncapped door on the direct-write surface. `save_memory_item`'s
+`title` field is now also capped via the existing `_truncate_text`/
+`_MEMORY_ITEM_FIELD_CAP` pattern. Both tools surface `truncated: true` when
+a field is cut.
+
+### Fixed: get_session_chain ignores auto-generated links by default (SH-101421)
+
+`get_session_chain` now filters to explicit links only unless
+`include_auto=True` is passed; previously a single explicit link could
+pull in an entire `auto:cooccurrence`-contaminated chain of unrelated
+sessions.
+
+### Documentation: Pro key-issuance runbook note (follow-up to SH-100131)
+
+`README.md`/`INSTALL.md` set the post-checkout expectation for manual Pro
+key issuance.
+
+## v0.10.8 (2026-09-02)
+
+### Security: MCP-tool trust boundary extension -- get_context_for + inject_agent_context (SH-101476)
+
+Extended the SH-13436 trust-boundary control from the Claude-Code-exclusive
+SessionStart hook to the MCP retrieval/injection surface. `get_context_for`
+wraps `summary` and every `decisions`/`open_questions` element in place;
+`inject_agent_context` wraps its assembled `context` field after the
+4000-char cap is applied (wrapper overhead is additive, not counted against
+the cap). Field names and types are unchanged on both tools -- only string
+*values* now carry wrapper markers.
+
+New vendored copy `src/core/trust_framing.py` (third copy alongside the hook
+and LoreDocs copies; HTML-comment convention since this surface is
+cross-vendor, not `<system-reminder>`). `scripts/check_trust_framing_sync.py`
+extended to three-way pairwise. 21 new tests (`test_trust_framing_mcp.py`) +
+2 updated (`test_agent_context_crud.py`) + 8 updated sync-check tests, all
+passing. Found by Brock (SH-101424, HIGH): these two tools were the only
+LoreConvo MCP surface still returning recalled session content unwrapped.
+
+### Documentation: Agent SDK local-load note in README (SH-101152)
+
+`README.md` gained a note in the install section covering direct Claude Agent
+SDK consumption: `git clone` the public repo and point the SDK's
+local-directory plugin loader at the repo root, which is already a
+self-contained plugin directory (`.claude-plugin/plugin.json` + `.mcp.json`).
+No separate SDK-installable bundle exists or is needed.
+
+### Documentation: tool-catalog sync for the v0.10.7 MCP fixes (SH-101244)
+
+`docs/mcp_tool_catalog.md` now documents two behaviors that shipped in
+v0.10.7 but were left undocumented: `save_session` preserves an existing
+`start_date` when the argument is omitted, and `get_session` returns
+`reasoning_notes` (null when none were saved).
+
+### Packaging: Agent Plugins 1.0 manifests tracked at the product root
+
+`plugin.json` and `mcp.json` at the product root are generated by
+`scripts/release.sh` and were previously untracked. They are now committed
+and carried in `BUMP_FILES`, so their version pins move with each release
+instead of drifting.
+
+## v0.10.7 (2026-08-28)
+
+### Fixed: MCP round-trip bugs -- start_date clobber + unreadable reasoning_notes (SH-101061)
+
+`src/server.py save_session` reset an existing session's `start_date` when
+updating without an explicit `start_date` arg; it now reads the existing row
+and preserves it. `get_session` omitted `reasoning_notes` from its response
+dict; now included. Regression tests: `tests/test_mcp_roundtrip_bugs.py`.
+
+### Fixed: proactive-consolidation cooldown queried wrong table (SH-100337)
+
+`src/core/consolidation.py check_proactive_consolidation` Gate 7 queried
+`memory_digest` (nonexistent) instead of `memory_digests`, so the cooldown
+read always fell into the "unreadable clock -> allow" branch. Table name
+corrected; cooldown now enforced. Tests: `tests/test_proactive_consolidation.py`.
+
+### Fixed: orphaned session_cooccurrences sweep at startup (SH-100951)
+
+`src/core/database.py` gains `_sweep_cooccurrence_orphans()`, wired into
+`_init_schema` (idempotent, logs removed count). Repairs legacy residue from
+deletes that predate FK enforcement; audit of all six sessions(id)-FK tables
+found only `session_cooccurrences` affected. Mutation-verified tests:
+`tests/test_cooccurrence_orphan_sweep.py`.
+
+### Improved: parse_list warns on non-JSON list args (SH-100992)
+
+`scripts/save_to_loreconvo.py parse_list()` emits a stderr warning naming the
+flag, expected format, and truncated received value when a list flag isn't
+valid JSON. Behavior unchanged (stored as single element, exit 0).
+
+### Internal: AGENT_ROLE comment reference renamed to AGENT_SESSION_ROLE (SH-101172)
+
+Comment-only in `hooks/scripts/auto_save.py`; matches the fleet-side env var
+rename. No behavior change.
+
+## v0.10.6 (2026-08-19)
+
+### Fixed: `hook_saves_failing` blind spot on module-scope import failures (SH-100629)
+
+A module-scope import error in a hook process dies before `_bootstrap`'s
+`except BootstrapError` handler exists, so no `hook_failure.json` breadcrumb
+was ever written -- `hook_saves_failing` silently reported false throughout
+the outage (production hit this for 3h11m on 2026-08-14, `ModuleNotFoundError:
+loreconvo.src`). `hooks/scripts/_write_generic_failure_breadcrumb.py` is a
+stdlib-only fallback now invoked by the three save-hook shell wrappers
+(`on_stop.sh`, `on_session_end.sh`, `on_pre_compact.sh`) on non-zero exit; it
+writes a generic breadcrumb only if the hook's own handler hasn't already
+written a fresher, richer one this run (mtime-vs-launch-timestamp check).
+`scripts/audit_hook_module_imports.py` adds an AST-based static check (wired
+into `safe_git.py` Step 0n) banning module-scope `import <product>` in hook
+scripts, blocking the bug class at commit time. Out of scope:
+`on_periodic_save.sh` (opt-in) and `on_session_start.sh` (read path, not a
+save).
+
+## v0.10.5 (2026-08-16)
+
+### Added: `core/loredocs_bridge.py` -- direct-sqlite3 LoreDocs access (SH-100670)
+
+Marketplace installs run LoreConvo and LoreDocs in isolated uvx environments,
+so `from loredocs.storage import ...` raised `ImportError` even when LoreDocs
+was installed and its database present -- a code path that only worked on a
+dev machine with both packages pip-installed into the same venv.
+`loredocs_bridge.py` reaches `~/.loredocs/loredocs.db` directly via `sqlite3`,
+mirroring the approach LoreDocs already uses in the reverse direction.
+Cross-link constants (schema version, embedding model/dim, L2 threshold,
+per-entity cap and debounce) are vendored copies of `loredocs/storage.py`'s
+definitions; `test_loredocs_bridge.py::TestConstantSync` imports the real
+`loredocs.storage` when available and asserts equality against it -- errors,
+does not skip, when loredocs is not importable (drift rule 1).
+
+Two new exception types, `LoreDocsAccessError` and `LoreDocsSchemaError`,
+make the three failure branches distinguishable instead of collapsing to one
+opaque message: not installed, installed but the DB is unreadable, and
+installed with a schema older than `REQUIRED_CROSS_LINK_SCHEMA_VERSION`. Four
+call sites converted: `get_docs_for_session`, `session_link_doc`,
+`_graph_cross_product_links`, `cross_link_session`. 32 new tests plus the
+constant-sync check.
+
+### Added: `after`/`before` date-range params on `search_sessions()` (SH-100303)
+
+`core/database.py:search_sessions()` and the `search_sessions` MCP tool in
+`server.py` take optional ISO-8601 UTC-instant `after`/`before` params, both
+`None` by default and inert when unset -- inclusive on `after`, exclusive on
+`before`. Closes the four open HIGH dispositions from the r4 review:
+
+- `datetime.fromisoformat()` rejects a trailing `Z` on Python 3.10 (accepted
+  from 3.11 on); the new `core/timeutil.parse_iso_utc()` normalizes `Z` ->
+  `+00:00` before parsing, so behavior no longer depends on interpreter
+  version.
+- The backfill-offset assumption from the v0.10.4 UTC migration is now
+  recorded in `schema_migration_log` -- the table existed but nothing wrote
+  to it.
+- Removed a dead `UPDATE` against `sessions.updated_at`, a column that does
+  not exist on `sessions` (the original proposal conflated it with
+  `memory_digests.updated_at`); it always raised `OperationalError`, silently
+  swallowed by the method's top-level `except`, which also skipped the
+  audit-log write above it.
+
+New coverage: `tests/test_search_date_range.py`, plus additions to
+`tests/test_start_date_normalization.py` and `tests/test_timeutil.py`.
+
+### Fixed: `compat_check.extract_live_version_from_source()` PEP 660 resolution (SH-100401)
+
+Only handled the legacy co-located editable-install layout (dist-info
+alongside the source tree), so a proper PEP 660 editable install (dist-info
+in site-packages, source root elsewhere) returned `None` instead of the live
+version. Now reads `direct_url.json`'s `url` field first to locate the real
+source root, falling back to the legacy layout. `get_server_info`'s
+`install_kind`/`version_from_source` self-declaration depends on this
+function, so this is what made that reporting correct on a real editable
+install rather than only on the co-located dev layout. Also fixed a
+cross-contamination bug where `compat_check.py`'s absolute import could
+resolve to LoreDocs' `compat_check` module instead of its own. 14 new tests
+(6 loreconvo `compat_check`, 6 loredocs `compat_check`, 2 shape-parity).
+
+## v0.10.4 (2026-08-14)
+
+### Added: `core/timeutil.utc_now_iso()` as the single timestamp source
+
+All session writers (`hooks/scripts/auto_save.py`, `periodic_save.py`,
+`pre_compact_save.py`) previously stamped rows with
+`datetime.now().isoformat()`, which is naive local time. They now share
+`utc_now_iso()`, which returns UTC with a `Z` suffix.
+`test_start_date_normalization.test_writer_modules_no_naive_datetime` is the
+guardrail against the naive form returning.
+
+Hooks resolve the module through `_bootstrap.resolve_timeutil()` rather than
+importing `loreconvo.core.timeutil` directly. Hooks run standalone under the
+hook runner and cannot assume the package is installed, and a module-level
+package import would also execute before the `resolve_storage_core()`
+try/except, killing the process before it could write the
+`hook_failure.json` breadcrumb. `resolve_timeutil()` mirrors the existing
+two-path algorithm: installed package first, then a bounded upward search for
+`src/core/timeutil.py` with no `sys.path` mutation.
+
+### Added: `SessionDatabase._migrate_normalize_start_date_utc()`
+
+One-time idempotent backfill converting `sessions.start_date`, `end_date` and
+`updated_at` values that carry no timezone designator, using the machine's
+current local offset. Appending the offset makes the value offset-aware and
+SQLite converts it to UTC on its own.
+
+Values that do not parse (malformed strings, date-only values) are excluded by
+an `IS NOT NULL` guard on the converted expression rather than written back.
+Without the guard, `strftime` returns `NULL` for those rows, which trips the
+`NOT NULL` constraint on `sessions.start_date` and aborts the migration for
+every valid row, and would blank an otherwise good `end_date`/`updated_at`.
+The migration runs under `_init_schema()` and re-attempts harmlessly while any
+unconvertible row remains.
+
+`test_start_date_normalization` exercises the shipped method directly instead
+of restating its SQL, and asserts the converted instant against a stdlib
+`datetime` oracle rather than against a second copy of the migration.
+
+### Added: `hook_saves_failing` on `get_server_info` and `get_stats`
+
+Both tools now report whether the `hook_failure.json` breadcrumb written by
+`_bootstrap` is present, surfacing a hook that cannot reach `storage_core`
+through the MCP surface rather than only on discarded hook stderr.
+
+### Added: `upgrade_url` on the `import_sessions` limit response
+
+The free-tier limit-hit branch now carries `LORECONVO_UPGRADE_URL` alongside
+the limit message.
+
+### Fixed: FTS5 query sanitization in the fallback script
+
+`scripts/save_to_loreconvo.py` passed raw input to `MATCH`, so FTS5 parsed
+bare hyphens and colons as query syntax and `SH-100406` raised
+`no such column: 100406`. It now calls `storage_core.sanitize_fts_query()`,
+the same sanitizer the MCP and CLI search paths use, so ticket refs are
+searchable at all. `sanitize_fts_query()` and `expand_compound_token()` moved
+into `storage_core` to make that sharing possible instead of a second copy.
+
+The `MATCH` failure fallback also changed from a substring `LIKE` over the
+whole raw query to a per-term `AND` over `LIKE`. Matching the full string meant
+`SH-100406 substack` never appeared verbatim in any summary and returned zero
+rows, which read as "never saved": adding a term must narrow a result set,
+never erase it.
+
+---
+
+## v0.10.3 (2026-08-11)
+
+### Added: Opt-in semantic dedup pass in `consolidate_memories`
+
+Consolidation can now collapse near-duplicate sessions before extracting
+signals, so a project where the same decision was restated across several
+sessions no longer produces a digest that repeats it. The pass compares the
+LanceDB embeddings already held for the candidate sessions and drops a session
+when its cosine similarity to a newer kept session exceeds the mode threshold.
+
+The `dedup` argument accepts three values:
+
+- `off` -- the pass does not run and consolidation behaves exactly as before.
+  This is the default.
+- `conservative` -- collapses near-verbatim restatements (cosine > 0.97).
+- `balanced` -- collapses paraphrases (cosine > 0.95).
+
+It can also be set with the `LORECONVO_CONSOLIDATION_DEDUP` environment
+variable; an explicit argument always wins over the env var. Matching is
+case-sensitive against those three lowercase literals, and an unrecognised
+value resolves to `off` with a logged warning rather than failing the call.
+
+The result dict gains `sessions_considered`, `sessions_collapsed`,
+`sessions_consolidated`, `dedup`, and `collapsed` -- the last being a list of
+`{session_id, similar_to, similarity}` records, so every collapse is
+attributable rather than silent. A session with no vector in the index is
+never collapsed, and the LanceDB read is scoped by project and surface, so a
+session outside the consolidation scope cannot be compared against. If
+LanceDB is unavailable the pass degrades to a pass-through.
+
+### Fixed: A failing hook could surface as a session error
+
+`on_session_end.sh` and `on_pre_compact.sh` propagated the Python exit code to
+the caller. Both hooks invoke LoreConvo through `uvx`, which is
+network-capable -- a first-run package download or an unreachable PyPI made
+the hook fail, and that failure reached the user as an error in a session that
+was otherwise fine. Both now log the failure to the hook log and exit 0
+unconditionally. A hook that cannot save is a lost save, not a broken session.
+
+### Fixed: Post-turn capture worker reprocessed entries it had already handled
+
+`capture_worker.py` read the capture queue looking only for `queued` entries
+and ignored the `processed` markers written beside them, so every drain
+re-summarized everything still in the queue file -- burning API calls against
+the daily ceiling and producing duplicate captures. The worker now reads the
+`processed` markers first and skips any `queued` entry whose timestamp and
+session ID have already been handled.
+
+### Fixed: Fallback save script bypassed the Free-tier session limit
+
+`scripts/save_to_loreconvo.py` -- the script path used when the MCP server is
+unavailable -- inserted new sessions without checking the 50-session Free
+limit that the MCP server's `save_session` enforces. Saving through the
+fallback therefore had no cap. The script now performs the same check before
+inserting a new session, and reports the limit with the upgrade link when it
+is reached. Updates to existing sessions are unaffected, since they do not add
+to the count.
+
+## v0.10.2 (2026-08-09)
+
+### Fixed: Commands named in errors and docs that could not run
+
+The `loreconvo` console script is the MCP server entry point
+(`loreconvo.server:main`). Several places named `loreconvo <command>` as if it
+were the CLI, so following them started a stdio server that waits on stdin
+instead of running the command. The bundled fallback CLI has no console script
+of its own; it is invoked `python -m loreconvo.cli <command>`.
+
+Corrected in four places:
+
+- `anthropic_bridge.py` -- the `ToolError` raised when memory deletion is
+  attempted through the Anthropic memory-tool bridge told the caller to run
+  `loreconvo inspect --delete <id>`. This is the only one reachable at
+  runtime rather than in documentation.
+- `cli.py` -- `export --help` described importing the bundle via
+  `loreconvo merge`.
+- `INSTALL.md` -- the Team memory (Pro) bullet, same command.
+- `skills/loreconvo/SKILL.md` -- the Chat-export section gave
+  `loreconvo export --last --format markdown`. This file ships in the
+  marketplace bundle, so the wrong form was also being read by Claude.
+
+Flags and command names were correct throughout; only the invocation prefix
+was wrong. A `cli-invocation` rule in `scripts/check_doc_sync.py` now derives
+the real command set from the Click/Typer app and fails the build on any
+shipped file naming a form that cannot work.
+
+### Fixed: `graph_session_map` missing from the MCP tool catalog
+
+The tool shipped in v0.10.0 but never reached
+`docs/mcp_tool_catalog.md`, and the catalog's stated tool count still read 38.
+Both corrected (39). The catalog had a drift test that could never run -- it
+pointed at the monorepo `docs/` rather than the product's, and its body opened
+with an unconditional skip -- so nothing caught the omission. The test now
+delegates to `check_doc_sync.py`, which fails when any user-facing tool is
+absent from the catalog or the stated count is stale.
+
+## v0.10.1 (2026-08-09)
+
+### Fixed: Documentation error in the v0.10.0 release notes
+
+The v0.10.0 notes and README gave the new license command as
+`loreconvo license clear`. That does not work: the `loreconvo` console script
+is the MCP server entry point, so the command starts a stdio server instead.
+The correct invocation is `python -m loreconvo.cli license clear`. Corrected
+in both the changelog and the README; no code changed.
+
+## v0.10.0 (2026-08-09)
+
+### Added: Knowledge-graph Mermaid export (`graph_session_map`)
+
+A new MCP tool renders the session graph -- sessions plus the `link_sessions`
+relationships between them -- as a Mermaid diagram that can be pasted into any
+Markdown renderer that supports Mermaid. Scope is controlled by project, a
+root session ID, and a neighborhood depth. This brings the user-facing tool
+count to 39.
+
+### Added: Post-turn capture hook (opt-in)
+
+A two-stage PostToolUse capture path. Stage 1 (`post_turn_capture.py`) is a
+fast enqueue that writes a work item to `~/.loreconvo/capture_queue/` every N
+tool calls; Stage 2 (`capture_worker.py`) drains the queue out of band and
+summarizes. This keeps per-turn hook latency off the critical path.
+
+Off by default. Enable with `LORECONVO_POST_TURN_CAPTURE=1`. Tunable with
+`LORECONVO_TURN_CAPTURE_INTERVAL` (default 10 tool calls) and
+`LORECONVO_TURN_CAPTURE_MAX_CALLS_PER_DAY`. Queue items older than 7 days are
+discarded.
+
+### Added: `license clear` command on the bundled fallback CLI
+
+`python -m loreconvo.cli license clear` clears the stored Pro license key.
+Pass `--suite` to also clear the suite-wide key held by the sibling product.
+Warnings raised by the underlying `license_store.clear_key()` are now surfaced
+in CLI output instead of being discarded.
+
+Note the invocation: the `loreconvo` console script is the MCP server entry
+point (`loreconvo.server:main`), so `loreconvo license clear` starts a stdio
+server rather than running this command. The bundled CLI at `src/cli.py` is a
+fallback surface for when MCP is unavailable and has no console script of its
+own. The separate `loreconvo-cli` package is a different product (PROD-00910)
+and does not carry this command.
+
+### Changed: Database initialization deferred to first tool call
+
+The MCP server previously constructed `SessionDatabase` at module import. It
+now initializes lazily on first use, which removes database setup from server
+startup. Note for anyone patching internals in tests: the module-level `db`
+global is gone, replaced by `_db` behind a `_get_db()` accessor.
+
+### Changed: Hook database write paths consolidated
+
+`auto_save.py`, `periodic_save.py`, and `pre_compact_save.py` now route all
+writes through a shared `core/storage_core.py` rather than each opening and
+configuring their own connection. Connection setup (WAL mode, busy timeout,
+row factory) has a single definition, and a guard test enforces that the
+schema DDL is not duplicated across modules. No behavior change intended.
+
+### Fixed: Spurious "install is degraded" warning on source installs
+
+The hook bootstrap resolves `storage_core` from the installed `loreconvo`
+package when one is present, and otherwise falls back to a bounded upward
+search for a local `src/core/storage_core.py`. It misclassified "no package
+installed" as "package installed but broken", because
+`importlib.util.find_spec("loreconvo.core")` raises `ModuleNotFoundError` when
+the parent package is absent rather than returning `None`, and a catch-all
+`except Exception` recorded that as a broken-package error.
+
+The effect was that every hook run on a source install (`install.sh`, no
+`pip install loreconvo`) printed `WARNING: loreconvo package is installed but
+broken (No module named 'loreconvo') ... The install is degraded; reinstall
+loreconvo`. Saves succeeded normally throughout -- the warning was false, but
+it advised a pointless reinstall. Only a genuinely broken package (parent
+importable, `core.storage_core` failing) now triggers degraded mode.
+
+### Security: cryptography 49.0.0 -> 50.0.0
+
+Picks up the fix for CVE-2026-69247.
+
+## v0.9.0 (2026-08-04)
+
+### Added: Agent context injection
+
+Two new MCP tools let agents auto-load targeted session context at session
+start instead of relying on ad hoc searches: `configure_agent_context` stores
+a named topic list per `(agent_name, project)`, and `inject_agent_context`
+returns matching session context as markdown (stored config or call-time
+topics), capped at 4000 characters. Responses use a four-state status enum
+(`ok`/`warning`/`partial`/`error`) -- callers must branch on `status`
+explicitly rather than treating anything other than `error` as success. See
+the `using-loreconvo` skill for the caller pattern.
+
+### Added: Structured memory items
+
+A new `memory_items` layer stores decisions, open questions, and artifacts as
+first-class structured records (separate from free-text session summaries),
+with lifecycle transitions (retire/answer/wont-answer), FTS5 search, and
+project scoping. New MCP tools: `save_memory_item`, `query_memory_items`,
+`transition_memory_item`, `update_memory_item`.
+
+## v0.8.10 (2026-07-31)
+
+### Changed: Hook output format change -- recalled-content trust boundary
+
+The auto-load SessionStart hook now wraps recalled session/digest content in
+an explicit untrusted-data delimiter (`<system-reminder id="...">...</system-reminder>`)
+before injecting it into Claude Code's context, with a per-session nonce, a
+provenance line per session ("heuristic capture", "LLM summarized (Pro)",
+etc.), and the removal of the prior free-floating instruction-like sentence
+at the end of the block.
+
+This is a framing/boundary-integrity fix (SH-13436), not a claim to solve
+prompt injection. The injected-context text format has never been a
+documented, stable contract for this hook; any external tooling parsing it
+structurally should expect this and future format changes.
+
+### Fixed: Auto-save length limits now match documented values
+
+Session auto-save was still capping saved summaries and decisions at limits
+left over from an earlier version of the hook (50,000 and 5,000 characters)
+rather than the smaller values actually intended for this release (8,000 and
+500). A separate bug in the truncation marker could also let a saved field
+run slightly past its limit instead of stopping at it.
+
+Starting in v0.8.10, saved summaries are capped at 8,000 characters and
+decisions at 500, and the `[TRUNCATED: ...]` marker is reserved inside that
+limit so a truncated field never exceeds it.
+
+## v0.8.9 (2026-07-28)
+
+### Fixed: Idle-watchdog now releases resources cleanly instead of killing the server
+
+The idle-watchdog timeout (5 minutes with no MCP messages) would force-exit the
+stdio server process when the timeout fired. Some clients (Claude Desktop, early
+Claude Code versions) park stdio servers open while they're idle instead of
+closing the pipe when they're done, causing the process to stay open, lock the
+database, and leak system resources.
+
+Starting in v0.8.9, the watchdog closes its database connection and drops its
+cached Lance semantic-search index, then returns cleanly instead of exiting the
+process. The server stays parked, but releases the resources it was holding.
+Clients that do close the pipe promptly are not affected. Clients that park the
+connection will now stay stable and will not block other Claude instances from
+accessing the database.
+
+If you were using the workaround environment variable `LORECONVO_IDLE_TIMEOUT=86400`
+(1 day) to avoid the server exit, you can remove it — the fix handles the timeout
+without needing a workaround.
+
+## v0.8.8 (2026-07-26)
+
+### Fixed: installing or updating LoreConvo from the marketplace
+
+Installing or updating LoreConvo from the plugin marketplace failed with
+"invalid manifest file ... Validation errors: hooks: Invalid input", and there
+was no way around it from the user's side.
+
+The plugin manifest declared its hooks in a shape the plugin loader does not
+accept. Nothing about LoreConvo itself was wrong, but the marketplace validates
+the manifest before it will install or update anything, so the whole plugin was
+rejected at the door. Versions 0.8.3 through 0.8.7 are all affected.
+
+This release fixes the manifest. Install and update both work again.
+
+If you are stuck on an older version, update normally; no manual cleanup is
+needed. There are no changes to the LoreConvo package itself in this release,
+so nothing about your data, settings, or saved sessions changes.
+
+## v0.8.7 (2026-07-26)
+
+### Installs and updates now work the way you would expect
+
+LoreConvo used to run from a Python virtual environment created in the source
+tree, or from `uvx loreconvo@latest`. Both had the same problem: what actually
+ran was not pinned. `@latest` resolves against a cache that can be stale, so a
+server could keep running an old version indefinitely, and "did the update take
+effect?" had no reliable answer. The venv had a sharper edge: its interpreter is
+a symlink to a system Python, so upgrading or removing that Python broke the
+server outright.
+
+The plugin now ships a configuration pinned to an exact version, and the server
+runs through `uvx` with its own managed Python. Installing or updating the
+plugin is what changes your version, and nothing else does. There is no virtual
+environment to create, break, or repair.
+
+If you installed a previous version, leftover packages from the old pip install
+are harmless; you can ignore them. Nothing needs to be uninstalled.
+
+### Fixed: "database disk image is malformed" during search, and stale search results
+
+A defect in the search index could corrupt it while saving a session, producing
+"database disk image is malformed" errors on subsequent searches. A related
+defect meant deleted sessions could leave fragments behind, so search sometimes
+matched text that no longer existed in any session.
+
+Both are fixed, and the fix is retroactive: upgrading repairs an index that has
+already been damaged. Your sessions are not affected either way, since the
+underlying data was never at risk, only the search index built over it. The
+repair runs automatically on first start after the upgrade and needs nothing
+from you. On a large history it may add a few seconds to that one startup.
+
+### Fixed: diagnostics no longer hide the reason for a failure
+
+`get_server_info` and the `loreconvo-compat-check` command reported that
+something was wrong without saying what: the underlying error text was being
+discarded. It is now included in the output. A missing `packaging` dependency
+was also causing the compatibility check to disable itself silently; that
+dependency is now declared, so the check runs and reports a real version.
+
+### One install, every tier: semantic search now works out of the box
+
+Semantic search used to be a separate install step. It needed the `[pro]`
+extra, which pulled in PyTorch: a large download, a second environment to keep
+up to date, and a common source of "why isn't semantic search working?"
+
+Semantic search now ships in the standard install. The same embedding model as
+before (BAAI/bge-small-en-v1.5) runs on ONNX Runtime instead of PyTorch, which
+is roughly a third of the download size. There is one install path and one
+environment for everyone. Pro is now purely a license flag: nothing extra to
+install to unlock it.
+
+`pip install loreconvo[pro]` still works and is now equivalent to a plain
+install, so existing scripts do not break.
+
+**Recommended one-time step:** run `rebuild_index` after upgrading. The new
+runtime produces very slightly different vectors than the old one, so an index
+built before this release will gradually drift out of step with new entries.
+Rebuilding brings everything back onto the same footing. Keyword search is
+unaffected and needs nothing.
+
+The first semantic search after upgrading downloads the model (about 90MB) and
+may take a minute. After that it is cached.
+
+### Updated: MCP SDK
+
+The bundled MCP SDK moves to 1.28.1, which carries fixes for three advisories in
+the versions LoreConvo previously pinned (CVE-2026-52870, CVE-2026-52869,
+CVE-2026-59950). None of them could affect LoreConvo: all three concern network
+transports and a multi-client task feature that LoreConvo does not use, since it
+runs over stdio as a single-client local server. The update means a security
+scan of your install comes back clean.
+
+## v0.8.6 (2026-07-24)
+
+### Docs: corrected MCP tool count and tool references
+
+The README and MCP tool catalog now report the accurate public tool count of 32
+(previously listed as 28). Four tools that ship in the server but were missing
+from the catalog are now documented: `pin_session`, `get_anti_patterns`,
+`tag_as_anti_pattern`, and `untag_anti_pattern`. A reference to a nonexistent
+`rebuild_semantic_index` tool was corrected to its real name, `rebuild_index`.
+The `get_server_info` version-compatibility diagnostic is now excluded from the
+advertised count, so "32 MCP tools" reflects user-facing tools only. This is a
+documentation-only release with no code or behavior changes.
+
+## v0.8.5 (2026-07-21)
+
+### Security: auxiliary file and directory permissions hardened (SH-12892)
+
+v0.8.4 hardened `sessions.db` itself; this release extends the same owner-only
+treatment to everything else LoreConvo writes under `~/.loreconvo/`. The data
+directory is now created with mode 0700, and `config.json` (both the tier
+config in `core/config.py` and the onboarding config in `core/onboard_tool.py`)
+plus the session-summarizer log file are chmod'd to 0600 on write. Files
+created by an earlier version or under a permissive umask are corrected the
+next time LoreConvo writes them.
+
+### Fixed: spurious MCP compatibility warning (SH-12969)
+
+The compatibility guard declared its tested MCP version as 1.27.2 while the
+pinned dependency is 1.27.0, so the guard reported a version mismatch against
+LoreConvo's own shipped pin. The constant now matches the pin and the warning
+no longer fires on a correct install.
+
+## v0.8.4 (2026-07-17)
+
+### Added: Durable Pro license persistence
+
+Your Pro license is now stored durably in a per-user file
+(`~/.loreconvo/license.json`, owner-only permissions) instead of depending on an
+environment variable being present in every shell. Once activated, Pro persists
+across restarts and new sessions. The license is resolved in a stable order:
+an environment variable takes precedence, then the file store, and a key
+supplied via the environment is written through to the file store automatically
+so it survives after the variable goes away. A short grace-period cache keeps
+Pro working through brief license-validation outages.
+
+Legacy installs that were granting Pro from an unverified local tier flag now
+get a bounded 30-day grace window instead of indefinite access; after that a
+verified key is required.
+
+### Added: Automatic session capture on stop
+
+LoreConvo now captures your session automatically when a Claude Code session is
+halted mid-work, via a Stop hook, so context is saved even when you do not run a
+manual save. The capture is overwritten by the normal end-of-session save when
+the session closes cleanly.
+
+## v0.8.3 (2026-07-15)
+
+### Security: Updated click to 8.3.3 (CVE-2026-7246)
+
+Bumped the `click` dependency from 8.3.1 to 8.3.3 to pick up the fix for
+CVE-2026-7246. No functional or API changes; this is a security-only patch
+release.
+
+## v0.8.2 (2026-07-11)
+
+### Fixed: Concurrent MCP clients no longer crash the server
+
+Removed the single-instance PID lock (introduced incidentally in v0.8.0).
+MCP clients that open more than one connection to the same server (some agent
+frontends race parallel discovery threads at startup) previously hit a
+RuntimeError crash-loop when the second connection arrived. LoreConvo now
+relies on the same WAL + busy_timeout=10000ms concurrent-access protection
+LoreDocs uses, so multiple simultaneous connections work. Covered by the new
+`test_concurrent_instances.py`.
+
+Also fixed pragma ordering in `_open_conn`: `busy_timeout` is now set before
+the `journal_mode=WAL` switch, so the timeout covers the mode-switch pragma
+under concurrent startup.
+
+### Security: sessions.db file permissions hardened (SH-12873)
+
+`sessions.db` is now chmod'd to owner-only permissions (0600) on every
+connection open in `_open_conn`, so a database created or touched by an
+earlier version (or a permissive umask) is corrected automatically.
+
+### Fixed: idle watchdog survives a broken stderr (SH-12881)
+
+The 5-minute idle watchdog no longer dies if its stderr pipe is closed when
+it fires (e.g. the parent client already disconnected). The shutdown itself
+proceeds normally.
+
+### Removed
+
+`scripts/rollback_anti_pattern_v080.py` -- the one-time rollback safety net
+for the v0.8.0 anti-pattern tables. Those tables are a permanent feature as
+of v0.8.1; the script was inert and nothing referenced it.
+
+## v0.8.1 (2026-07-08)
+
+### New: User-Controlled Session Durability (keep_forever)
+
+Adds explicit session pinning so users can exclude sessions from automated
+cleanup, closing the parity gap with Recall's "Durable Memory" tier (SH-11449).
+
+**New MCP tool:** `pin_session(session_id, keep_forever=True)`
+  - Pin a session to exclude it from automated cleanup.
+  - Accepts bool, int (0/1), or string ("true"/"false"/"1"/"0") for keep_forever.
+  - Returns `{"ok": True, "session_id": "...", "keep_forever": bool}`.
+  - Returns `{"ok": False, "code": "feature_disabled", ...}` when pinning is
+    disabled via LORECONVO_DISABLE_PINNING or config.json.
+
+**New CLI command:** `loreconvo pin <session_id> [--unpin]`
+  - Pin a session: `loreconvo pin <uuid>`
+  - Unpin a session: `loreconvo pin <uuid> --unpin`
+  - Exit codes: 0 = success, 1 = user error, 2 = DB error.
+
+**New CLI flag:** `loreconvo save --permanent`
+  - Save and immediately pin the session in one step.
+
+**Schema change:** `keep_forever INTEGER NOT NULL DEFAULT 0` column added to
+  the `sessions` table. Migration runs automatically on first startup.
+  All existing sessions read as `keep_forever=False` (DEFAULT 0).
+
+**Enforcement:** A `sessions_prunable` view (rows where `keep_forever=0`) with
+  an INSTEAD OF DELETE trigger is the primary enforcement layer. All cleanup
+  paths route through this view. A BEFORE DELETE trigger on `sessions` is a
+  secondary defense-in-depth for raw-SQL tooling.
+
+**Pinning disable (three-tier rollback):**
+  - Tier 1: Set `LORECONVO_DISABLE_PINNING=1` (shell users).
+  - Tier 2: Write `{"pinning_enabled": false}` to `~/.loreconvo/config.json`
+    (managed marketplace users without shell access).
+  - Tier 3: `pip install loreconvo==0.8.0` (PyPI users only).
+
+**Downgrade instructions:** If you downgrade to 0.8.0 and a tool issues
+  bare `DELETE FROM sessions` (bypassing the view), run:
+  `scripts/loreconvo_0.8.1_downgrade.sql`
+  Back up `sessions.db` first. After running, keep_forever=1 sessions lose
+  protection. See the script header for full details.
+
+**inspect_sessions:** Single-session detail now includes `keep_forever` (0 or 1).
+
+**auto_load hook:** Pinned sessions receive a +1 scoring bonus (user-curation
+  signal), same weight as artifact presence.
+
+**Architecture:** SH-11664 / SH-12733 (r6 APPROVED_WITH_OPEN_HIGHS, 4 rounds).
+
+---
+
+## v0.8.0 (2026-06-26)
+
+### New: Anti-Pattern Storage
+
+Tag past sessions as anti-patterns so you and your agents can surface known
+failure modes before repeating them.
+
+**Three new MCP tools:**
+
+- `get_anti_patterns([topic], [limit], [project])` -- Retrieve sessions tagged
+  as anti-patterns. Call this at session start or before a tricky task to see
+  what has failed before. Filter by keyword (`topic`) or project slug.
+  Returns session ID, title, date, summary, decisions, and open questions for
+  each match. Tagging is sparse by design, so FTS5 results may be slightly
+  under-complete when `topic` is supplied -- the `truncated` field signals this.
+
+- `tag_as_anti_pattern(session_id, source, reason)` -- Mark a session as an
+  anti-pattern. Idempotent: tagging an already-tagged session is safe.
+  Rate-limited to 20 calls per window to prevent bulk misuse.
+
+- `untag_anti_pattern(session_id, source, reason)` -- Remove an anti-pattern
+  tag. Idempotent. Both tag and untag record an audit entry so you can see the
+  full tagging history for any session.
+
+**Database changes:** Three new tables added automatically on first startup
+after upgrade -- no manual migration needed:
+- `anti_pattern_sessions` -- which sessions are tagged and when
+- `anti_pattern_audit_log` -- full audit trail of every tag/untag operation
+- `anti_pattern_rate_state` -- rate-limit state per caller
+
+**Schema validation at startup:** LoreConvo now validates the anti-pattern
+table schema on startup and exits immediately if a mismatch is detected
+(protects against partial upgrades). Use the `--dry-run-validate` flag to run
+just this check without starting the server: exit 0 = schema OK, exit 1 = mismatch.
+
+**Duplicate server prevention:** A PID lockfile (`~/.loreconvo/server.pid`)
+prevents two server instances from sharing the same database simultaneously.
+If you launch a second server against the same database, it exits with an error
+pointing to the running process ID. The lockfile is cleaned up automatically on
+exit.
+
+**Rollback:** `rollback_anti_pattern_v080.py` drops the three anti-pattern
+tables and reverts to v0.7.5 schema. Back up `sessions.db` first; rolling back
+discards all anti-pattern tags permanently.
+
+32 MCP tools, 8 CLI commands.
+
+---
+
+(Earlier changelog entries not included; see git log for full history.)

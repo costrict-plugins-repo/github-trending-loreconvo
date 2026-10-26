@@ -1,0 +1,683 @@
+"""LoreConvo storage core -- stdlib-only module for database connections.
+
+Imports only stdlib modules so hooks can import it without pulling in
+config, hybrid_search, or models. Every database connection path must
+go through _open_conn() so WAL, busy_timeout, foreign_keys=ON, and
+file permissions stay consistent.
+
+This module is the single source of truth for DDL constants, schema
+revision, connection opening, schema initialization, session upsert,
+and FTS5 query sanitization. database.py imports from here and
+re-exports _open_conn so no existing caller changes.
+"""
+
+import logging
+import os
+import re
+import sqlite3
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+# Schema revision -- increment on any DDL change.
+# Used as PRAGMA user_version for cross-environment compatibility gating.
+SCHEMA_REVISION = 3
+
+# ---------------------------------------------------------------------------
+# DDL constants
+# ---------------------------------------------------------------------------
+
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS sessions (
+    id              TEXT PRIMARY KEY NOT NULL,
+    title           TEXT NOT NULL,
+    surface         TEXT NOT NULL,
+    project         TEXT,
+    start_date      TEXT NOT NULL,
+    end_date        TEXT,
+    summary         TEXT,
+    decisions       TEXT,
+    artifacts       TEXT,
+    open_questions  TEXT,
+    tags            TEXT,
+    created_at      TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    source          TEXT DEFAULT 'session',
+    external_tool_session INTEGER DEFAULT 0,
+    shared_by       TEXT,
+    origin_machine  TEXT,
+    content_hash    TEXT,
+    reasoning_notes TEXT,
+    previous_summary TEXT,
+    expires_at      TEXT,
+    staleness_hint  TEXT,
+    keep_forever    INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS session_skills (
+    session_id       TEXT NOT NULL REFERENCES sessions(id),
+    skill_name       TEXT NOT NULL,
+    skill_source     TEXT,
+    invocation_count INTEGER DEFAULT 1,
+    position         INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (session_id, skill_name)
+);
+
+CREATE TABLE IF NOT EXISTS projects (
+    name            TEXT PRIMARY KEY,
+    description     TEXT,
+    expected_skills TEXT,
+    default_persona TEXT,
+    instructions    TEXT,
+    created_at      TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+
+CREATE TABLE IF NOT EXISTS persona_sessions (
+    persona_name    TEXT NOT NULL,
+    session_id      TEXT NOT NULL REFERENCES sessions(id),
+    relevance_note  TEXT,
+    PRIMARY KEY (persona_name, session_id)
+);
+
+CREATE TABLE IF NOT EXISTS session_links (
+    from_session_id TEXT NOT NULL REFERENCES sessions(id),
+    to_session_id   TEXT NOT NULL REFERENCES sessions(id),
+    link_type       TEXT DEFAULT 'continues',
+    PRIMARY KEY (from_session_id, to_session_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_start_date ON sessions(start_date);
+CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project);
+CREATE INDEX IF NOT EXISTS idx_persona_sessions_name ON persona_sessions(persona_name);
+
+CREATE TABLE IF NOT EXISTS session_cooccurrences (
+    term       TEXT NOT NULL,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    frequency  INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (term, session_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cooccurrences_session ON session_cooccurrences(session_id);
+CREATE INDEX IF NOT EXISTS idx_cooccurrences_term ON session_cooccurrences(term);
+
+CREATE TABLE IF NOT EXISTS project_instruction_audit (
+    id              TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+    project_name    TEXT NOT NULL REFERENCES projects(name),
+    session_id      TEXT,
+    changed_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    old_value       TEXT,
+    new_value       TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_project_instruction_audit_project ON project_instruction_audit(project_name);
+CREATE INDEX IF NOT EXISTS idx_project_instruction_audit_date ON project_instruction_audit(changed_at);
+"""
+
+DREAMING_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS memory_digests (
+    id              TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+    project         TEXT NOT NULL,
+    surface         TEXT,
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    source_count    INTEGER DEFAULT 0,
+    oldest_session_date TEXT,
+    newest_session_date TEXT,
+    decisions       TEXT,
+    open_questions  TEXT,
+    known_stack     TEXT,
+    stale_facts     TEXT,
+    digest_markdown TEXT,
+    mode            TEXT DEFAULT 'heuristic',
+    tier            TEXT DEFAULT 'free',
+    disabled        INTEGER DEFAULT 0,
+    api_key_found   INTEGER DEFAULT 1,
+    source_session_ids TEXT,
+    safety_invalidated INTEGER DEFAULT 0,
+    UNIQUE(project, surface)
+);
+"""
+
+FTS_SQL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
+    title, summary, decisions, tags, open_questions, reasoning_notes,
+    content=sessions, content_rowid=rowid
+);
+"""
+
+FTS_TRIGGERS = """
+CREATE TRIGGER IF NOT EXISTS sessions_ai AFTER INSERT ON sessions BEGIN
+    INSERT INTO sessions_fts(rowid, title, summary, decisions, tags, open_questions, reasoning_notes)
+    VALUES (new.rowid, new.title, new.summary, new.decisions, new.tags, new.open_questions, new.reasoning_notes);
+END;
+
+-- sessions_fts is an EXTERNAL-CONTENT table (content=sessions). Rows must be
+-- removed with the special 'delete' command carrying the OLD column values --
+-- a plain UPDATE/DELETE corrupts the index (SH-13438). Do not "simplify" these
+-- back to ordinary DML.
+CREATE TRIGGER IF NOT EXISTS sessions_au AFTER UPDATE ON sessions BEGIN
+    INSERT INTO sessions_fts(sessions_fts, rowid, title, summary, decisions,
+        tags, open_questions, reasoning_notes)
+    VALUES ('delete', old.rowid, old.title, old.summary, old.decisions,
+        old.tags, old.open_questions, old.reasoning_notes);
+    INSERT INTO sessions_fts(rowid, title, summary, decisions, tags,
+        open_questions, reasoning_notes)
+    VALUES (new.rowid, new.title, new.summary, new.decisions, new.tags,
+        new.open_questions, new.reasoning_notes);
+END;
+
+CREATE TRIGGER IF NOT EXISTS sessions_ad AFTER DELETE ON sessions BEGIN
+    INSERT INTO sessions_fts(sessions_fts, rowid, title, summary, decisions,
+        tags, open_questions, reasoning_notes)
+    VALUES ('delete', old.rowid, old.title, old.summary, old.decisions,
+        old.tags, old.open_questions, old.reasoning_notes);
+END;
+"""
+
+ANTI_PATTERN_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS anti_pattern_sessions (
+    session_id TEXT NOT NULL,
+    tagged_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    source     TEXT NOT NULL DEFAULT 'unknown',
+    PRIMARY KEY (session_id),
+    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_anti_pattern_tagged_at
+    ON anti_pattern_sessions (tagged_at DESC);
+
+CREATE TABLE IF NOT EXISTS anti_pattern_audit_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT NOT NULL,
+    action      TEXT NOT NULL CHECK(action IN ('tag', 'untag')),
+    source      TEXT NOT NULL DEFAULT 'unknown',
+    reason      TEXT,
+    occurred_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS idx_ap_audit_session
+    ON anti_pattern_audit_log (session_id, occurred_at DESC);
+
+CREATE TABLE IF NOT EXISTS anti_pattern_rate_state (
+    operation    TEXT NOT NULL PRIMARY KEY,
+    window_start TEXT NOT NULL,
+    call_count   INTEGER NOT NULL DEFAULT 0
+);
+"""
+
+# ---------------------------------------------------------------------------
+# Connection management
+# ---------------------------------------------------------------------------
+
+def _is_in_memory_db(db_path) -> bool:
+    """True for in-memory SQLite databases.
+
+    In-memory databases cannot use WAL -- ``PRAGMA journal_mode=WAL`` always
+    returns "memory" -- and there is no file for a second client to lock into a
+    conflicting mode, so the WAL mixing guard does not apply to them. Used by
+    tests (db_path=":memory:") and any in-memory URI form.
+    """
+    p = str(db_path)
+    if p == ":memory:":
+        return True
+    if p.startswith("file:"):
+        return ":memory:" in p or "mode=memory" in p
+    return False
+
+
+def discover_loreconvo_db(
+    custom_path: str | None = None, require_existing: bool = False
+) -> Path:
+    """Discover the LoreConvo sessions.db using unified logic.
+
+    Priority order:
+    1. custom_path (--db-path flag argument)
+    2. LORECONVO_DB environment variable
+    3. Cowork VM mount paths (/sessions/*/mnt/.loreconvo/sessions.db)
+    4. Default ~/.loreconvo/sessions.db
+
+    require_existing=True makes a set-but-missing LORECONVO_DB (and an
+    absent default path) raise FileNotFoundError -- the fallback script's
+    hard-fail contract, never a silent fall-through to a different corpus.
+    Default False preserves the server's create-on-first-use contract:
+    Config() returns the env-named path even when the file does not exist
+    yet and SessionDatabase creates it on first write.
+
+    Returns Path object (may not exist; caller is responsible for creation).
+    """
+    custom_path_arg = custom_path
+    if custom_path_arg:
+        return Path(custom_path_arg).expanduser().resolve()
+    if os.environ.get("LORECONVO_DB"):
+        env_path = Path(os.environ["LORECONVO_DB"]).expanduser().resolve()
+        if not env_path.exists() and require_existing:
+            raise FileNotFoundError(
+                f"ERROR: LORECONVO_DB is set but database does not exist at "
+                f"{env_path}.\nFix the path, unset LORECONVO_DB, or pass --db-path."
+            )
+        return env_path
+    try:
+        sessions_dir = Path("/sessions")
+        if sessions_dir.exists():
+            for mount_db in sessions_dir.glob("*/mnt/.loreconvo/sessions.db"):
+                if mount_db.exists():
+                    return mount_db
+    except (OSError, PermissionError):
+        pass
+    default_path = Path.home() / ".loreconvo" / "sessions.db"
+    if not default_path.exists() and require_existing:
+        raise FileNotFoundError(
+            f"ERROR: no LoreConvo database found at {default_path} and no "
+            f"LORECONVO_DB override is set."
+        )
+    return default_path
+
+
+def _open_conn(db_path, busy_timeout_ms=10000) -> sqlite3.Connection:
+    """Open a SQLite connection with all required pragmas for LoreConvo.
+
+    Sets isolation_level=None (autocommit), row_factory=Row, WAL mode (with
+    warning on filesystems that do not support WAL), busy_timeout (default
+    10000ms for core, 2000ms for hooks), and foreign_keys=ON. All connection
+    open paths must use this helper so FK enforcement is guaranteed on every
+    connection.
+    """
+    conn = sqlite3.connect(str(db_path), isolation_level=None, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
+    row = conn.execute("PRAGMA journal_mode=WAL").fetchone()
+    actual_mode = row[0] if row else "unknown"
+    if actual_mode != "wal" and not _is_in_memory_db(db_path):
+        logger.warning(
+            "Database at '%s' is in '%s' journal mode; WAL is unavailable "
+            "on this filesystem (common with network mounts, FUSE, or "
+            "filesystems without POSIX shared-memory). Falling back to "
+            "'%s' mode. This process's own connection locking prevents "
+            "intra-process conflicts, but if other processes open the "
+            "same file with a different journal mode, corruption is "
+            "possible.",
+            db_path,
+            actual_mode,
+            actual_mode,
+        )
+    conn.execute("PRAGMA foreign_keys=ON")
+    # sessions.db is created with umask-derived permissions (644 on standard 022
+    # systems). Force 600 unconditionally so session data is never world-readable.
+    # WAL sidecar files are chmod'd if they already exist; they are created lazily
+    # by SQLite on first write and will be corrected on the next open.
+    if not _is_in_memory_db(db_path):
+        _p = str(db_path)
+        if os.path.exists(_p):
+            os.chmod(_p, 0o600)
+        for _sidecar in (_p + '-shm', _p + '-wal'):
+            if os.path.exists(_sidecar):
+                os.chmod(_sidecar, 0o600)
+    return conn
+
+
+# ---------------------------------------------------------------------------
+# Schema initialization
+# ---------------------------------------------------------------------------
+
+def ensure_schema(conn: sqlite3.Connection) -> None:
+    """Run CREATE TABLE IF NOT EXISTS and stamp user_version.
+
+    Idempotent -- safe to call on every connection open. Stamps
+    PRAGMA user_version = SCHEMA_REVISION when the current value is
+    lower (never downgrades).
+    """
+    conn.executescript(SCHEMA_SQL)
+    session_cols = {
+        row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()
+    }
+    missing_columns = {
+        "shared_by": "TEXT",
+        "origin_machine": "TEXT",
+        "content_hash": "TEXT",
+        "reasoning_notes": "TEXT",
+        "previous_summary": "TEXT",
+        "expires_at": "TEXT",
+        "staleness_hint": "TEXT",
+        "keep_forever": "INTEGER NOT NULL DEFAULT 0",
+    }
+    for name, column_type in missing_columns.items():
+        if name not in session_cols:
+            conn.execute(
+                f"ALTER TABLE sessions ADD COLUMN {name} {column_type}"
+            )
+    # session_skills gained a `position` column (SH-103920) to preserve the
+    # order skills were used in. The hook path opens DBs via ensure_schema,
+    # which has no table-recreation migration, so add the column here too.
+    skill_cols = {
+        row[1] for row in conn.execute("PRAGMA table_info(session_skills)").fetchall()
+    }
+    if "position" not in skill_cols:
+        conn.execute(
+            "ALTER TABLE session_skills ADD COLUMN position INTEGER NOT NULL DEFAULT 0"
+        )
+    row = conn.execute("PRAGMA user_version").fetchone()
+    current = row[0] if row else 0
+    if current < SCHEMA_REVISION:
+        conn.execute(f"PRAGMA user_version = {SCHEMA_REVISION}")
+
+
+# ---------------------------------------------------------------------------
+# Session upsert -- single definition for all callers
+# ---------------------------------------------------------------------------
+
+def upsert_session(conn: sqlite3.Connection, session_id: str, title: str,
+                   surface: str, project: str = None, start_date: str = None,
+                   end_date: str = None, summary: str = None,
+                   decisions: str = None, artifacts: str = None,
+                   open_questions: str = None, tags: str = None,
+                   source: str = "session",
+                   external_tool_session: int = 0) -> None:
+    """Insert or update a session row.
+
+    Uses an UPSERT with the canonical column set. All callers
+    (hooks, core, fallback script, summarizer) use this single definition
+    so FK cascades, column defaults, and conflict resolution are uniform.
+    """
+    existing = conn.execute(
+        "SELECT summary, project, surface, source, external_tool_session "
+        "FROM sessions WHERE id=?",
+        (session_id,),
+    ).fetchone()
+    conn.execute(
+        """INSERT INTO sessions
+           (id, title, surface, project, start_date, end_date,
+            summary, decisions, artifacts, open_questions, tags,
+            source, external_tool_session)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(id) DO UPDATE SET
+           title=excluded.title,
+           surface=excluded.surface,
+           project=excluded.project,
+           start_date=excluded.start_date,
+           end_date=excluded.end_date,
+           previous_summary=CASE
+               WHEN sessions.summary IS NOT excluded.summary THEN sessions.summary
+               ELSE sessions.previous_summary
+           END,
+           summary=excluded.summary,
+           decisions=excluded.decisions,
+           artifacts=excluded.artifacts,
+           open_questions=excluded.open_questions,
+           tags=excluded.tags,
+           source=excluded.source,
+           external_tool_session=excluded.external_tool_session""",
+        (session_id, title, surface, project, start_date, end_date,
+         summary, decisions, artifacts, open_questions, tags,
+         source, external_tool_session),
+    )
+    if existing and any((
+        existing["summary"] != summary,
+        existing["project"] != project,
+        existing["surface"] != surface,
+        existing["source"] != source,
+        bool(existing["external_tool_session"]) != bool(external_tool_session),
+    )):
+        try:
+            for digest_project, digest_surface in (
+                (existing["project"], existing["surface"]),
+                (project, surface),
+            ):
+                if digest_project is not None:
+                    conn.execute(
+                        "UPDATE memory_digests SET safety_invalidated=1 "
+                        "WHERE project=? AND (surface IS NULL OR surface IS ?)",
+                        (digest_project, digest_surface),
+                    )
+        except sqlite3.OperationalError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# FTS5 query sanitization
+#
+# Single source of truth. database.py (SessionDatabase) and the fallback
+# script in scripts/ both import these -- neither re-implements them.
+# Raw user input must never reach a MATCH clause: FTS5 parses bare
+# hyphens and colons as query syntax, so "SH-100406" raises
+# OperationalError: no such column: 100406.
+# ---------------------------------------------------------------------------
+
+def expand_compound_token(token: str):
+    """Split a compound token (camelCase, PascalCase) into parts.
+
+    Returns the original token plus its constituent parts for camelCase/PascalCase
+    so FTS5 matches both the compound form and individual words.
+
+    Snake_case tokens are NOT expanded -- they are returned as-is.
+    This avoids false matches from common subwords (e.g., "social" in "social_pipeline").
+
+    Only expands tokens that are purely alphanumeric (plus underscores).
+    Tokens with hyphens, colons, or other special chars are left as-is
+    since those are not compound identifiers.
+
+    Examples:
+        "autoSave"      -> ["autoSave", "auto", "Save"]
+        "PreCompact"    -> ["PreCompact", "Pre", "Compact"]
+        "snake_case"    -> ["snake_case"]
+        "simple"        -> ["simple"]
+        "agent:ron"     -> ["agent:ron"]  (colon = not a compound)
+        "K-1"           -> ["K-1"]        (hyphen = not a compound)
+    """
+    # Only attempt expansion on tokens that look like identifiers
+    # (alphanumeric + underscores only)
+    if not re.match(r'^[A-Za-z0-9_]+$', token):
+        return [token]
+
+    # snake_case / SCREAMING_SNAKE: don't expand, return as-is
+    # (e.g., "social_pipeline" -> ["social_pipeline"], not ["social_pipeline", "social", "pipeline"])
+    if '_' in token:
+        return [token]
+
+    parts = []
+    # camelCase / PascalCase: split on case transitions
+    # "autoSave" -> ["auto", "Save"], "HTMLParser" -> ["HTML", "Parser"]
+    camel_parts = re.findall(r'[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|[0-9]+', token)
+    if len(camel_parts) > 1:
+        parts = camel_parts
+
+    if not parts:
+        return [token]
+    # Return original token first (for exact match), then expanded parts
+    return [token] + parts
+
+
+def sanitize_fts_query(query: str) -> str:
+    """Sanitize and preprocess user input for FTS5 MATCH.
+
+    Processing steps:
+    1. Split on whitespace into raw tokens.
+    2. Handle explicit trailing `*` by stripping it before processing.
+    3. Expand compound tokens (camelCase, snake_case) into parts.
+    4. Apply prefix matching (trailing *) for short alpha tokens (<=10 chars)
+       so partial terms like "consolid" match "consolidation".
+    5. Quote each token to escape FTS5 operators (hyphens, colons).
+    6. Implicit AND across all tokens (FTS5 default).
+
+    Examples:
+        "stripe billing"     -> '"stripe" "billing"'
+        "autoSave"           -> '"autoSave" OR "auto" OR "Save"'
+        "snake_case"         -> '"snake_case" OR "snake" OR "case"'
+        "consolid"           -> '"consolid"*'
+        "word*"              -> '"word"*'
+        "fts-migration"      -> '"fts-migration"'
+        "agent:ron"          -> '"agent:ron"'
+        "K-1 parser waiting" -> '"K-1" "parser" "waiting"'
+    """
+    safe = query.strip()
+    if not safe:
+        return '""'
+
+    raw_tokens = safe.split()
+    fts_groups = []
+    has_or_group = False
+
+    for token in raw_tokens:
+        clean = token.replace('"', '')
+        if not clean:
+            continue
+
+        # Strip explicit trailing `*` to check conditions on the base token
+        has_trailing_wildcard = clean.endswith('*')
+        base_token = clean.rstrip('*') if has_trailing_wildcard else clean
+
+        expanded = expand_compound_token(base_token)
+
+        if len(expanded) > 1:
+            # Compound token: OR the original with its parts
+            parts = ['"' + p + '"' for p in expanded]
+            fts_groups.append('(' + ' OR '.join(parts) + ')')
+            has_or_group = True
+        else:
+            # Single token: apply prefix matching for short terms
+            # Tokens <= 10 chars that are purely alphabetic are treated as
+            # likely abbreviations or partial words (e.g., "consolid" -> consolidation)
+            t = expanded[0]
+            if len(t) <= 10 and t.isalpha():
+                # Short alphabetic token -- prefix match
+                fts_groups.append('"' + t + '"*')
+            else:
+                # Longer or non-alphabetic token -- no prefix match
+                # But preserve explicit trailing `*` if user provided it
+                if has_trailing_wildcard:
+                    fts_groups.append('"' + t + '"*')
+                else:
+                    fts_groups.append('"' + t + '"')
+
+    if not fts_groups:
+        return '""'
+
+    # FTS5 requires explicit AND when combining parenthesized OR-groups
+    # with other terms. Implicit AND only works between simple tokens.
+    joiner = ' AND ' if has_or_group else ' '
+    return joiner.join(fts_groups)
+
+
+# ---------------------------------------------------------------------------
+# Capture-time field caps -- one derivation shared by the SessionEnd hook
+# path (auto_save.py) and the direct-write MCP path (database.py).
+# ---------------------------------------------------------------------------
+
+# Ratified capture-time caps (SH-13531). The hook path enforces them in
+# auto_save.py; SH-101425 extended them to the direct-write save_session
+# path; SH-101877 makes both paths share this one truncation derivation so
+# a cut always carries a visible [TRUNCATED] marker.
+#
+# SH-101938 (ratified divergence): the direct-write path now deliberately
+# allows MORE than the hook path. The hook caps defend against unbounded
+# machine-generated transcript text with no human in the loop; the direct
+# path holds deliberate, bounded, authored content. Do NOT re-unify these
+# two pairs, and do NOT change the hook pair without a new ratification.
+_MAX_SESSION_SUMMARY_LENGTH = 8000        # hook path (auto_save.py)
+_MAX_SESSION_LIST_ITEM_LENGTH = 500       # hook path (auto_save.py)
+_MAX_DIRECT_SUMMARY_LENGTH = 15000        # direct save_session path
+_MAX_DIRECT_LIST_ITEM_LENGTH = 2000       # direct save_session path
+
+
+def _truncate_if_needed(value, max_length, field_name):
+    """Truncate value to max_length chars, adding a [TRUNCATED] marker.
+
+    The marker is reserved INSIDE the cap (the content slice is shortened
+    by len(marker)) so the result never exceeds max_length including the
+    marker. Appending the marker after the slice was the SH-13718 overshoot
+    bug on the hook path -- do not reintroduce it. Returns the value
+    unchanged when it fits or is falsy.
+
+    The cut trims back to the last space (word boundary) so words are never
+    split mid-character (SH-101907). A single-word value longer than the
+    cap falls back to the raw slice (no space to anchor on).
+
+    If max_length is smaller than the marker itself, reserving space for
+    the marker would leave a negative content length and the marker would
+    overshoot max_length on its own (SH-102442). In that case skip the
+    marker entirely and return a plain slice, which always respects the cap.
+    """
+    if not value or len(value) <= max_length:
+        return value
+    marker = f" [TRUNCATED: {field_name} exceeds {max_length} chars]"
+    if len(marker) > max_length:
+        return value[:max_length]
+    max_content_length = max_length - len(marker)
+    # Trim to last word boundary so the cut never splits a word.
+    space = value.rfind(" ", 0, max_content_length)
+    if space > 0:
+        max_content_length = space
+    return value[:max_content_length] + marker
+
+
+# ---------------------------------------------------------------------------
+# Permission remediation (no SQLite connection -- os.stat + os.chmod only)
+# ---------------------------------------------------------------------------
+
+def remediate_permissions(data_dir: str) -> None:
+    """Fix permissions on the data directory and database files.
+
+    Stats the data directory, sessions.db, and any -wal/-shm sidecars.
+    Chmods to 0700 (directory) or 0600 (files) when the current mode is
+    wider. Logs once per process which files were corrected.
+
+    Opens no SQLite connection, takes no database lock, and is safe to
+    run concurrently with anything including an active writer.
+    """
+    data_path = Path(data_dir)
+    files_to_check = [data_path]
+    db_path = data_path / "sessions.db"
+    if db_path.exists():
+        files_to_check.append(db_path)
+        for sidecar in (str(db_path) + '-shm', str(db_path) + '-wal'):
+            sp = Path(sidecar)
+            if sp.exists():
+                files_to_check.append(sp)
+
+    for path in files_to_check:
+        try:
+            st = path.stat()
+            current_mode = st.st_mode & 0o777
+            if path.is_dir():
+                target_mode = 0o700
+            else:
+                target_mode = 0o600
+            if current_mode != target_mode:
+                os.chmod(path, target_mode)
+                logger.info(
+                    "remediate_permissions: corrected %s from 0%o to 0%o",
+                    path, current_mode, target_mode,
+                )
+        except OSError:
+            pass  # best-effort; log at debug if needed
+
+
+# ---------------------------------------------------------------------------
+# Project name normalization (SH-103918)
+# ---------------------------------------------------------------------------
+
+# Known non-canonical project names mapped to their canonical form.
+# When new variants are discovered, add them here and re-run the migration.
+PROJECT_ALIASES: dict[str, str] = {
+    "labyrinthanalytics_website": "labyrinth_analytics_website",
+}
+
+
+def normalize_project_name(project: str | None) -> str | None:
+    """Normalize a project name to its canonical form.
+
+    Steps: strip -> lowercase -> resolve alias -> collapse runs of
+    underscores -> strip leading/trailing underscores.
+
+    Returns None for a None or empty-string input (the (none) bucket),
+    since an empty string is semantically the same as None for project
+    filtering but creates a separate bucket in GROUP BY queries.
+    """
+    if project is None:
+        return None
+    stripped = project.strip()
+    if not stripped:
+        return None
+    lowered = stripped.lower()
+    # Resolve known aliases before underscore normalization so the
+    # canonical form is always the one stored.
+    canonical = PROJECT_ALIASES.get(lowered, lowered)
+    # Collapse runs of underscores and strip leading/trailing
+    collapsed = re.sub(r'_+', '_', canonical).strip('_')
+    return collapsed if collapsed else None
